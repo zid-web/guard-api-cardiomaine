@@ -2,11 +2,12 @@
 API REST pour la generation des gardes/astreintes - Planning Cardiomaine
 Point d'entree principal, a deployer (Render, Railway, Fly.io...)
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from solver import GenerateWeekRequest, GenerateWeekResponse, generate_week
 from voice_command import VoiceCommandRequest, VoiceCommandResponse, handle_voice_command
+from pdf_upload import PdfUploadResponse, handle_pdf_upload
 
 app = FastAPI(
     title="API Generation Gardes - Cardiomaine",
@@ -52,3 +53,18 @@ def voice_command_endpoint(req: VoiceCommandRequest, x_api_key: str = ""):
     """
     _check_api_key(x_api_key)
     return handle_voice_command(req)
+
+
+@app.post("/upload-planning-pdf", response_model=PdfUploadResponse)
+async def upload_planning_pdf_endpoint(file: UploadFile = File(...), x_api_key: str = ""):
+    """
+    Recoit un PDF scanne du planning, l'analyse via Claude Vision, et renvoie :
+    - l'extraction brute complete (toutes les lignes, pour controle humain)
+    - le sous-ensemble mappe vers existing_schedule (pret a etre injecte dans /generate-week)
+    - les avertissements sur les cellules illisibles/ambigues
+    """
+    _check_api_key(x_api_key)
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=422, detail="Le fichier doit etre un PDF.")
+    file_bytes = await file.read()
+    return handle_pdf_upload(file_bytes)

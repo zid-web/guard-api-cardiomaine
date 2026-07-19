@@ -162,7 +162,7 @@ def apply_command_to_schedule(
 
     # Reconstruit existing_schedule à partir de celui déjà présent (préserve les autres saisies)
     existing = dict(current_request.existing_schedule or {})
-    existing[(row_key, day_name)] = [cmd.doctor_in]
+    existing[f"{row_key}||{day_name}"] = [cmd.doctor_in]
 
     updated_request = current_request.model_copy(update={"existing_schedule": existing})
 

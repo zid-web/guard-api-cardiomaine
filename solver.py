@@ -42,7 +42,7 @@ class GenerateWeekRequest(BaseModel):
     vacations: List[Vacation] = []
     weekend_mode: Literal["CH", "ROTATION"] = "ROTATION"
     last_nct_doctor: Optional[str] = None  # W ou M
-    existing_schedule: Optional[Dict[Tuple[str, str], List[str]]] = None  # (row_key, day) -> [doctors]
+    existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
 
 class Assignment(BaseModel):
     date: str
@@ -408,7 +408,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     # --- 10. Préservation des saisies manuelles ---
     if req.existing_schedule:
-        for (row_key, day_name), doctors in req.existing_schedule.items():
+        for combined_key, doctors in req.existing_schedule.items():
+            row_key, _, day_name = combined_key.partition("||")
             slot, activity = map_row_key_to_slot_activity(row_key)
             if slot is None or activity is None:
                 continue

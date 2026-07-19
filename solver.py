@@ -40,6 +40,7 @@ class GenerateWeekRequest(BaseModel):
     week_type: int                    # 1 = impaire, 2 = paire
     medecins: List[Medecin]
     vacations: List[Vacation] = []
+    congres: List[Vacation] = []      # même structure que vacations : doctor_id, start_date, end_date
     weekend_mode: Literal["CH", "ROTATION"] = "ROTATION"
     last_nct_doctor: Optional[str] = None  # W ou M
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
@@ -63,7 +64,32 @@ class GenerateWeekResponse(BaseModel):
 
 DAY_NAMES_FR = ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI", "DIMANCHE"]
 SLOTS = ["matin", "am", "nuit"]
-ACTIVITIES = ["ASTREINTE", "GARDE", "CORO", "NCT"]
+ACTIVITIES = ["ASTREINTE", "GARDE", "CORO", "NCT", "REEDUC", "PRE_OP", "RYTHMO"]
+
+# Listes d'éligibilité explicites par code médecin (priment sur les règles par statut)
+REEDUC_ALLOWED = {"Z", "B", "S", "G", "H"}          # seuls éligibles pour REEDUC
+REEDUC_DAYS = {"LUNDI", "MERCREDI", "VENDREDI"}      # seuls jours où REEDUC existe (am uniquement)
+CORO_ALLOWED = {"W", "M", "O", "FV"}                 # seuls éligibles pour CORO
+RYTHMO_ALLOWED = {"A", "U", "P"}                     # seuls éligibles pour RYTHMO
+NCT_ALLOWED = {"M", "W"}                             # seuls éligibles pour NCT
+
+# Calendrier NCT déjà planifié à l'avance (prime sur le calcul d'équité/alternance
+# pour les jeudis concernés). Clé = date ISO du jeudi, valeur = code médecin.
+# Liste à compléter au fur et à mesure (communiquée par l'utilisateur).
+NCT_FIXED_SCHEDULE = {
+    "2026-07-23": "M",
+    "2026-09-10": "M",
+    "2026-09-17": "W",
+    "2026-09-24": "M",
+    "2026-10-01": "W",
+    "2026-10-15": "M",
+    "2026-10-29": "W",
+    "2026-11-05": "M",
+    "2026-11-19": "W",
+    "2026-11-26": "M",
+    "2026-12-03": "W",
+    "2026-12-17": "M",
+}
 
 # Séquences autorisées pour M/O/W (matin, am, nuit)
 ALLOWED_SEQUENCES = [
@@ -108,6 +134,10 @@ def map_row_key_to_slot_activity(row_key: str) -> Tuple[Optional[str], Optional[
         "Matin - Coro": ("matin", "CORO"),
         "Apm - Coro": ("am", "CORO"),
         "Hors site - NCT": ("nuit", "NCT"),
+        "Reeduc": ("am", "REEDUC"),          # hypothèse : créneau après-midi, à confirmer
+        "Pre Op": ("am", "PRE_OP"),          # hypothèse : créneau après-midi, à confirmer
+        "Matin - Rythmo": ("matin", "RYTHMO"),   # hypothèse : même structure que CORO (2 lignes), à confirmer
+        "Apm - Rythmo": ("am", "RYTHMO"),
     }
     return mapping.get(row_key, (None, None))
 
@@ -161,18 +191,28 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 return
 
         day_name = DAY_NAMES_FR[d_idx]
-        if day_name in half_days_off and slot in half_days_off[day_name]:
-            if doc_id in half_days_off[day_name][slot]:
-                return
+        if (day_name, slot) in half_days_off and doc_id in half_days_off[(day_name, slot)]:
+            return
 
         if doc_id in fixed_exclusions and d_idx in fixed_exclusions[doc_id]:
+            return
+
+        # Restrictions explicites par code médecin (priment sur les règles par statut)
+        if activity == "REEDUC":
+            if day_name not in REEDUC_DAYS or slot != "am" or doc_id not in REEDUC_ALLOWED:
+                return
+        if activity == "CORO" and doc_id not in CORO_ALLOWED:
+            return
+        if activity == "RYTHMO" and doc_id not in RYTHMO_ALLOWED:
+            return
+        if activity == "NCT" and (doc_id not in NCT_ALLOWED or d_idx != 3):
             return
 
         statut = medecins_map[doc_id].statut
         if statut == StatutMedecin.CH:
             return
         if statut == StatutMedecin.PERMANENT:
-            if activity not in ("ASTREINTE", "GARDE"):
+            if activity not in ("ASTREINTE", "GARDE", "REEDUC", "PRE_OP", "RYTHMO"):
                 return
         if statut == StatutMedecin.ASTREINTE_CORO:
             if activity == "NCT" and doc_id not in nct_pool:
@@ -190,12 +230,16 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     add_var_if_allowed(doc_id, d_idx, slot, activity)
 
     # --- 3. Contraintes générales ---
-    # Capacité max 2 par case
+    # Règle absolue : jamais 2 médecins sur une même case (jour + créneau + activité),
+    # applicable à toutes les activités gérées par le solveur : ASTREINTE, GARDE, CORO, NCT.
+    # (Les catégories vacances / congé / congrès / 1/2 journée libre / ETT salle 1-2 ne sont
+    # pas soumises à cette règle : elles sont traitées séparément, cf. section 13bis.)
     for d_idx in range(7):
         for slot in SLOTS:
-            case_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == slot]
-            if case_vars:
-                model.Add(sum(case_vars) <= 2)
+            for activity in ACTIVITIES:
+                case_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == slot and act == activity]
+                if case_vars:
+                    model.Add(sum(case_vars) <= 1)
 
     # Un médecin ne fait qu'une activité par créneau
     for doc_id in medecins_map:
@@ -242,24 +286,51 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                             model.Add(var == 0)
 
     # --- 5. NCT (jeudi nuit) ---
+    thursday_iso = days[3].isoformat()
     nct_vars = [v for (doc, d, sl, act), v in x.items() if d == 3 and sl == "nuit" and act == "NCT"]
-    if nct_vars:
-        model.Add(sum(nct_vars) == 1)
+
+    if thursday_iso in NCT_FIXED_SCHEDULE:
+        # Calendrier déjà planifié à l'avance : prime sur l'alternance/l'équité pour ce jeudi précis.
+        fixed_doctor = NCT_FIXED_SCHEDULE[thursday_iso]
+        var_fixed = x.get((fixed_doctor, 3, "nuit", "NCT"))
+        if var_fixed is not None:
+            model.Add(var_fixed == 1)
+            for (doc, d, sl, act), var in x.items():
+                if d == 3 and sl == "nuit" and act == "NCT" and doc != fixed_doctor:
+                    model.Add(var == 0)
+        else:
+            warnings.append(
+                f"JEUDI {thursday_iso} : NCT planifiée pour {fixed_doctor} mais ce médecin "
+                f"n'est pas disponible ce jour (vacances ou exclu) - à réassigner manuellement"
+            )
     else:
-        warnings.append("JEUDI : aucun médecin disponible pour la NCT (vacances ou exclu)")
+        if nct_vars:
+            model.Add(sum(nct_vars) == 1)
+        else:
+            warnings.append("JEUDI : aucun médecin disponible pour la NCT (vacances ou exclu)")
 
-    # Alternance NCT : ne pas répéter le même que la semaine précédente
-    if req.last_nct_doctor and req.last_nct_doctor in nct_pool:
-        var_nct = x.get((req.last_nct_doctor, 3, "nuit", "NCT"))
-        if var_nct is not None:
-            model.Add(var_nct == 0)
+        # Alternance NCT : ne pas répéter le même que la semaine précédente
+        if req.last_nct_doctor and req.last_nct_doctor in nct_pool:
+            var_nct = x.get((req.last_nct_doctor, 3, "nuit", "NCT"))
+            if var_nct is not None:
+                model.Add(var_nct == 0)
 
-    # NCT interdit si astreinte nuit la veille (mercredi)
-    for doc in nct_pool:
-        var_nct = x.get((doc, 3, "nuit", "NCT"))
-        var_astreinte_mercredi = x.get((doc, 2, "nuit", "ASTREINTE"))
-        if var_nct is not None and var_astreinte_mercredi is not None:
-            model.AddImplication(var_nct, var_astreinte_mercredi.Not())
+        # NCT interdit si astreinte nuit la veille (mercredi)
+        for doc in nct_pool:
+            var_nct = x.get((doc, 3, "nuit", "NCT"))
+            var_astreinte_mercredi = x.get((doc, 2, "nuit", "ASTREINTE"))
+            if var_nct is not None and var_astreinte_mercredi is not None:
+                model.AddImplication(var_nct, var_astreinte_mercredi.Not())
+
+    # --- 5bis. REEDUC (obligatoire, 1 médecin exactement, Lundi/Mercredi/Vendredi am) ---
+    for d_idx, day_nm in enumerate(DAY_NAMES_FR):
+        if day_nm not in REEDUC_DAYS:
+            continue
+        reeduc_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == "am" and act == "REEDUC"]
+        if reeduc_vars:
+            model.Add(sum(reeduc_vars) == 1)
+        else:
+            warnings.append(f"{day_nm} : aucun médecin disponible pour REEDUC (vacances ou exclu)")
 
     # --- 6. Fixes forcés (FV) ---
     if fv_id:
@@ -525,6 +596,48 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     else:
         warnings.append("Aucune solution trouvée par le solveur")
+
+    # --- 13bis. Lignes dérivées (non optimisées par le solveur) ---
+    # Vacances : reflète directement req.vacations pour les jours de la semaine en cours.
+    # Congé : contenu systématiquement identique à Vacances (retranscription automatique).
+    for v in req.vacations:
+        v_start = date.fromisoformat(v.start_date)
+        v_end = date.fromisoformat(v.end_date)
+        for d_idx, day in enumerate(days):
+            if v_start <= day <= v_end:
+                assignments.append(Assignment(
+                    date=day.isoformat(), day_name=DAY_NAMES_FR[d_idx],
+                    slot="weekend" if d_idx >= 5 else "matin", activity="VACANCES",
+                    doctor=v.doctor_id, note="Saisie vacances"
+                ))
+                assignments.append(Assignment(
+                    date=day.isoformat(), day_name=DAY_NAMES_FR[d_idx],
+                    slot="weekend" if d_idx >= 5 else "matin", activity="CONGE",
+                    doctor=v.doctor_id, note="Retranscrit automatiquement depuis Vacances"
+                ))
+
+    # Congrès : même logique que vacances, à partir de req.congres.
+    for c in req.congres:
+        c_start = date.fromisoformat(c.start_date)
+        c_end = date.fromisoformat(c.end_date)
+        for d_idx, day in enumerate(days):
+            if c_start <= day <= c_end:
+                assignments.append(Assignment(
+                    date=day.isoformat(), day_name=DAY_NAMES_FR[d_idx],
+                    slot="weekend" if d_idx >= 5 else "matin", activity="CONGRES",
+                    doctor=c.doctor_id, note="Saisie congrès"
+                ))
+
+    # 1/2 journée libre : dérivée directement de la règle métier déjà codée (half_days_off).
+    for (day_name_key, slot_key), doctors_off in half_days_off.items():
+        d_idx = DAY_NAMES_FR.index(day_name_key)
+        for doc in doctors_off:
+            if doc in medecins_map:
+                assignments.append(Assignment(
+                    date=days[d_idx].isoformat(), day_name=day_name_key,
+                    slot=slot_key, activity="DEMI_JOURNEE_LIBRE",
+                    doctor=doc, note="Règle fixe demi-journée libre"
+                ))
 
     # Trier
     assignments.sort(key=lambda a: (a.date, SLOTS.index(a.slot) if a.slot in SLOTS else 999))

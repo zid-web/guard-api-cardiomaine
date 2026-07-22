@@ -1,0 +1,358 @@
+diff --git a/config.py b/config.py
+new file mode 100644
+index 0000000..c300da5
+--- /dev/null
++++ b/config.py
+@@ -0,0 +1,64 @@
++"""
++Chargement des règles métier (listes d'éligibilité, demi-journées off, calendrier NCT fixe...)
++depuis un fichier JSON plutôt que codées en dur dans solver.py.
++
++But : permettre de changer une règle (ex: un médecin change de statut, une nouvelle
++exclusion) sans avoir à modifier le code Python ni redéployer le service.
++
++Deux niveaux de configuration, fusionnés à chaque appel :
++1. Défaut : rules_config.json, embarqué avec le service (sert de filet de sécurité).
++2. Surcharge : `rules_override` optionnel dans la requête /generate-week, que le
++   front peut renseigner depuis une table Supabase modifiable par un administrateur,
++   sans jamais toucher au code de ce service.
++
++Limite actuelle : le fichier JSON par défaut nécessite quand même un redéploiement
++pour changer. La vraie souplesse vient de `rules_override` envoyé par le front -
++à brancher sur une table Supabase dédiée (ex: `rules_config`) côté front.
++"""
++import json
++import os
++from typing import Any, Dict, Optional
++
++_CONFIG_PATH = os.environ.get(
++    "GUARD_RULES_CONFIG_PATH",
++    os.path.join(os.path.dirname(__file__), "rules_config.json"),
++)
++
++_cached_default_rules: Optional[Dict[str, Any]] = None
++
++
++def load_default_rules() -> Dict[str, Any]:
++    """Charge (et met en cache) les règles par défaut depuis rules_config.json."""
++    global _cached_default_rules
++    if _cached_default_rules is None:
++        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
++            _cached_default_rules = json.load(f)
++    return _cached_default_rules
++
++
++def merge_rules(default: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++    """
++    Fusionne superficiellement les règles par défaut avec une surcharge envoyée
++    dans la requête. Une clé présente dans `override` remplace entièrement la
++    valeur par défaut correspondante (pas de fusion profonde champ par champ).
++    """
++    if not override:
++        return default
++    merged = dict(default)
++    for key, value in override.items():
++        if key in merged:
++            merged[key] = value
++    return merged
++
++
++def half_days_off_as_dict(rules: Dict[str, Any]) -> Dict[Any, set]:
++    """Convertit la liste JSON `half_days_off` en dict {(jour, créneau): {médecins}}."""
++    result = {}
++    for entry in rules.get("half_days_off", []):
++        result[(entry["day"], entry["slot"])] = set(entry["doctors"])
++    return result
++
++
++def fixed_exclusions_as_dict(rules: Dict[str, Any]) -> Dict[str, set]:
++    """Convertit `fixed_exclusions` JSON en dict {médecin: {indices de jour}}."""
++    return {doc: set(days) for doc, days in rules.get("fixed_exclusions", {}).items()}
+diff --git a/main.py b/main.py
+index 3b6ff4c..1d95914 100644
+--- a/main.py
++++ b/main.py
+@@ -2,8 +2,9 @@
+ API REST pour la generation des gardes/astreintes - Planning Cardiomaine
+ Point d'entree principal, a deployer (Render, Railway, Fly.io...)
+ """
+-from fastapi import FastAPI, HTTPException, UploadFile, File
++from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+ from fastapi.middleware.cors import CORSMiddleware
++from typing import Optional
+ import os
+ from solver import GenerateWeekRequest, GenerateWeekResponse, generate_week
+ from voice_command import VoiceCommandRequest, VoiceCommandResponse, handle_voice_command
+@@ -24,9 +25,13 @@ app.add_middleware(
+ )
+ 
+ API_KEY = os.environ.get("GUARD_API_KEY", "")
++if not API_KEY:
++    # Ne bloque pas le demarrage (utile en dev), mais le fait savoir clairement
++    # dans les logs Render : sans GUARD_API_KEY definie, l'API reste PUBLIQUE.
++    print("[WARN] GUARD_API_KEY n'est pas definie : l'API est actuellement sans authentification.")
+ 
+ 
+-def _check_api_key(x_api_key: str):
++def _check_api_key(x_api_key: Optional[str]):
+     if API_KEY and x_api_key != API_KEY:
+         raise HTTPException(status_code=401, detail="Cle API invalide ou manquante")
+ 
+@@ -37,7 +42,10 @@ def health_check():
+ 
+ 
+ @app.post("/generate-week", response_model=GenerateWeekResponse)
+-def generate_week_endpoint(req: GenerateWeekRequest, x_api_key: str = ""):
++def generate_week_endpoint(
++    req: GenerateWeekRequest,
++    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
++):
+     _check_api_key(x_api_key)
+     try:
+         return generate_week(req)
+@@ -46,7 +54,10 @@ def generate_week_endpoint(req: GenerateWeekRequest, x_api_key: str = ""):
+ 
+ 
+ @app.post("/voice-command", response_model=VoiceCommandResponse)
+-def voice_command_endpoint(req: VoiceCommandRequest, x_api_key: str = ""):
++def voice_command_endpoint(
++    req: VoiceCommandRequest,
++    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
++):
+     """
+     Recoit un texte (transcrit cote navigateur via Web Speech API), l'interprete
+     via Claude, applique la contrainte au planning et renvoie le planning recalcule.
+@@ -56,7 +67,10 @@ def voice_command_endpoint(req: VoiceCommandRequest, x_api_key: str = ""):
+ 
+ 
+ @app.post("/upload-planning-pdf", response_model=PdfUploadResponse)
+-async def upload_planning_pdf_endpoint(file: UploadFile = File(...), x_api_key: str = ""):
++async def upload_planning_pdf_endpoint(
++    file: UploadFile = File(...),
++    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
++):
+     """
+     Recoit un PDF scanne du planning, l'analyse via Claude Vision, et renvoie :
+     - l'extraction brute complete (toutes les lignes, pour controle humain)
+diff --git a/rules_config.json b/rules_config.json
+new file mode 100644
+index 0000000..a55105f
+--- /dev/null
++++ b/rules_config.json
+@@ -0,0 +1,33 @@
++{
++  "wom_pool": ["W", "O", "M"],
++  "reeduc_allowed": ["Z", "B", "S", "G", "H"],
++  "reeduc_days": ["LUNDI", "MERCREDI", "VENDREDI"],
++  "coro_allowed": ["W", "M", "O", "FV"],
++  "rythmo_allowed": ["A", "U", "P"],
++  "nct_allowed": ["M", "W"],
++  "half_days_off": [
++    { "day": "MERCREDI", "slot": "am", "doctors": ["M", "W", "G", "Z", "H"] },
++    { "day": "JEUDI", "slot": "am", "doctors": ["U", "S", "P"] },
++    { "day": "VENDREDI", "slot": "am", "doctors": ["O", "A", "K", "R", "T"] }
++  ],
++  "fixed_exclusions": {
++    "P": [1],
++    "U": [2],
++    "A": [0, 3],
++    "S": [0, 4]
++  },
++  "nct_fixed_schedule": {
++    "2026-07-23": "M",
++    "2026-09-10": "M",
++    "2026-09-17": "W",
++    "2026-09-24": "M",
++    "2026-10-01": "W",
++    "2026-10-15": "M",
++    "2026-10-29": "W",
++    "2026-11-05": "M",
++    "2026-11-19": "W",
++    "2026-11-26": "M",
++    "2026-12-03": "W",
++    "2026-12-17": "M"
++  }
++}
+diff --git a/solver.py b/solver.py
+index 95ce5ad..4352602 100644
+--- a/solver.py
++++ b/solver.py
+@@ -9,6 +9,8 @@ from typing import List, Dict, Optional, Literal, Set, Tuple, Any
+ from pydantic import BaseModel
+ import enum
+ 
++from config import load_default_rules, merge_rules, half_days_off_as_dict, fixed_exclusions_as_dict
++
+ # ============================================================
+ # 1. MODÈLES DE DONNÉES (entrée / sortie)
+ # ============================================================
+@@ -44,6 +46,7 @@ class GenerateWeekRequest(BaseModel):
+     weekend_mode: Literal["CH", "ROTATION"] = "ROTATION"
+     last_nct_doctor: Optional[str] = None  # W ou M
+     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
++    rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
+ 
+ class Assignment(BaseModel):
+     date: str
+@@ -66,30 +69,10 @@ DAY_NAMES_FR = ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI", "DI
+ SLOTS = ["matin", "am", "nuit"]
+ ACTIVITIES = ["ASTREINTE", "GARDE", "CORO", "NCT", "REEDUC", "PRE_OP", "RYTHMO"]
+ 
+-# Listes d'éligibilité explicites par code médecin (priment sur les règles par statut)
+-REEDUC_ALLOWED = {"Z", "B", "S", "G", "H"}          # seuls éligibles pour REEDUC
+-REEDUC_DAYS = {"LUNDI", "MERCREDI", "VENDREDI"}      # seuls jours où REEDUC existe (am uniquement)
+-CORO_ALLOWED = {"W", "M", "O", "FV"}                 # seuls éligibles pour CORO
+-RYTHMO_ALLOWED = {"A", "U", "P"}                     # seuls éligibles pour RYTHMO
+-NCT_ALLOWED = {"M", "W"}                             # seuls éligibles pour NCT
+-
+-# Calendrier NCT déjà planifié à l'avance (prime sur le calcul d'équité/alternance
+-# pour les jeudis concernés). Clé = date ISO du jeudi, valeur = code médecin.
+-# Liste à compléter au fur et à mesure (communiquée par l'utilisateur).
+-NCT_FIXED_SCHEDULE = {
+-    "2026-07-23": "M",
+-    "2026-09-10": "M",
+-    "2026-09-17": "W",
+-    "2026-09-24": "M",
+-    "2026-10-01": "W",
+-    "2026-10-15": "M",
+-    "2026-10-29": "W",
+-    "2026-11-05": "M",
+-    "2026-11-19": "W",
+-    "2026-11-26": "M",
+-    "2026-12-03": "W",
+-    "2026-12-17": "M",
+-}
++# Les listes d'éligibilité par médecin (REEDUC_ALLOWED, CORO_ALLOWED, RYTHMO_ALLOWED,
++# NCT_ALLOWED), les demi-journées off, les exclusions fixes et le calendrier NCT figé
++# ne sont plus codés en dur ici : ils sont chargés depuis rules_config.json (+ surcharge
++# optionnelle envoyée par le front dans req.rules_override). Voir config.py.
+ 
+ # Séquences autorisées pour M/O/W (matin, am, nuit)
+ ALLOWED_SEQUENCES = [
+@@ -150,28 +133,27 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
+     week_start = date.fromisoformat(req.week_start_date)
+     days = jours_semaine(week_start)
+ 
++    # --- 0. Chargement des règles (défaut JSON + surcharge éventuelle du front) ---
++    rules = merge_rules(load_default_rules(), req.rules_override)
++    REEDUC_ALLOWED = set(rules["reeduc_allowed"])
++    REEDUC_DAYS = set(rules["reeduc_days"])
++    CORO_ALLOWED = set(rules["coro_allowed"])
++    RYTHMO_ALLOWED = set(rules["rythmo_allowed"])
++    NCT_ALLOWED = set(rules["nct_allowed"])
++    NCT_FIXED_SCHEDULE = rules["nct_fixed_schedule"]
++
+     # --- 1. Préparation des données ---
+     medecins_map = {m.id: m for m in req.medecins}
+     astreinte_coro_ids = {m.id for m in req.medecins if m.statut == StatutMedecin.ASTREINTE_CORO}  # W, O, M
+-    wom_pool = ["W", "O", "M"]  # explicit
++    wom_pool = rules["wom_pool"]
+     nct_pool = {m.id for m in req.medecins if m.statut == StatutMedecin.ASTREINTE_CORO and m.id != "O"}
+     fv_id = next((m.id for m in req.medecins if m.statut == StatutMedecin.FV), None)
+     daas_id = next((m.id for m in req.medecins if m.statut == StatutMedecin.DAAS), None)
+     d_id = next((m.id for m in req.medecins if m.statut == StatutMedecin.D), None)
+ 
+-    # Demi-journées libres
+-    half_days_off = {
+-        ("MERCREDI", "am"): {"M", "W", "G", "Z", "H"},
+-        ("JEUDI", "am"): {"U", "S", "P"},
+-        ("VENDREDI", "am"): {"O", "A", "K", "R", "T"},
+-    }
+-
+-    fixed_exclusions = {
+-        "P": {1},
+-        "U": {2},
+-        "A": {0, 3},
+-        "S": {0, 4},
+-    }
++    # Demi-journées libres et exclusions fixes : chargées depuis rules_config.json
++    half_days_off = half_days_off_as_dict(rules)
++    fixed_exclusions = fixed_exclusions_as_dict(rules)
+ 
+     # --- 2. Création des variables ---
+     model = cp_model.CpModel()
+@@ -498,26 +480,65 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
+                         model.Add(var == 0)
+ 
+     # --- 11. Équité (objectif) ---
+-    points = {doc: 0 for doc in astreinte_coro_ids}
+-    for (doc, d_idx, slot, activity), var in x.items():
+-        if doc in astreinte_coro_ids:
+-            points[doc] += var
+-
+-    # Points de weekend (si WOM en weekend, on ajoute les points)
+-    if req.weekend_mode == "ROTATION":
+-        # On n'ajoute pas de points supplémentaires ici car ils sont déjà comptés
+-        pass
+-
+-    if "M" in points and "W" in points:
+-        model.Add(points["M"] == points["W"])
+-
+-    if "O" in points and "M" in points:
+-        dev_O = model.NewIntVar(0, 10, "dev_O")
+-        model.Add(dev_O >= points["O"] - points["M"])
+-        model.Add(dev_O >= points["M"] - points["O"])
+-        model.Minimize(dev_O)
++    # Poids relatifs par type d'activité (harmonisés avec les compteurs historiques
++    # points_astreinte / points_garde / points_nct / points_weekend envoyés par le front).
++    # Configurable ici sans toucher au reste du solveur.
++    WEIGHT_ASTREINTE = 1
++    WEIGHT_GARDE = 1
++    WEIGHT_NCT = 2       # nuit du jeudi, plus contraignante
++    WEIGHT_WEEKEND = 2   # astreinte de weekend, plus contraignante
++
++    def activity_weight(activity: str, d_idx: int) -> int:
++        if activity == "NCT":
++            return WEIGHT_NCT
++        if activity == "ASTREINTE" and d_idx in (5, 6):
++            return WEIGHT_WEEKEND
++        if activity == "ASTREINTE":
++            return WEIGHT_ASTREINTE
++        if activity == "GARDE":
++            return WEIGHT_GARDE
++        return 0  # CORO / REEDUC / RYTHMO / PRE_OP : hors périmètre équité garde/astreinte
++
++    # Médecins concernés par l'équité garde/astreinte : tous les statuts qui peuvent
++    # réellement être affectés à ASTREINTE/GARDE/NCT (PERMANENT + ASTREINTE_CORO).
++    # Exclus : CH (structure fixe), FV/DAAS/D (créneaux externes fixes), ADMIN.
++    equity_doctor_ids = {
++        m.id for m in req.medecins
++        if m.statut in (StatutMedecin.PERMANENT, StatutMedecin.ASTREINTE_CORO)
++    }
++
++    total_points: Dict[str, Any] = {}
++    for doc in equity_doctor_ids:
++        m = medecins_map[doc]
++        historical = (
++            m.points_astreinte * WEIGHT_ASTREINTE
++            + m.points_garde * WEIGHT_GARDE
++            + m.points_nct * WEIGHT_NCT
++            + m.points_weekend * WEIGHT_WEEKEND
++        )
++        this_week_terms = [
++            activity_weight(activity, d_idx) * var
++            for (doc_id_x, d_idx, slot, activity), var in x.items()
++            if doc_id_x == doc and activity_weight(activity, d_idx) > 0
++        ]
++        # IntVar bornée large pour couvrir historique + charge de la semaine
++        upper_bound = historical + 7 * (WEIGHT_NCT + WEIGHT_WEEKEND + WEIGHT_GARDE) + 10
++        total_var = model.NewIntVar(0, max(upper_bound, 1), f"total_points_{doc}")
++        model.Add(total_var == historical + sum(this_week_terms))
++        total_points[doc] = total_var
++
++    if total_points:
++        max_points = model.NewIntVar(0, 100000, "max_points")
++        min_points = model.NewIntVar(0, 100000, "min_points")
++        for doc, var in total_points.items():
++            model.Add(max_points >= var)
++            model.Add(min_points <= var)
++        # Objectif principal : minimiser l'écart entre le médecin le plus chargé
++        # et le moins chargé, historique cumulé inclus (pas seulement cette semaine).
++        model.Minimize(max_points - min_points)
+     else:
+-        model.Minimize(sum(points.values()))
++        warnings.append("Équité : aucun médecin éligible trouvé pour l'objectif d'équité")
++
+ 
+     # --- 12. Résolution ---
+     solver = cp_model.CpSolver()

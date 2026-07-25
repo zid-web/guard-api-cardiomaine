@@ -21,6 +21,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 import anthropic
 
+from llm_json import parse_llm_json
+
 from solver import (
     GenerateWeekRequest,
     GenerateWeekResponse,
@@ -106,9 +108,7 @@ Consigne à interpréter : "{text}"
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_text = response.content[0].text.strip()
-        # Sécurité : au cas où le modèle ajouterait des backticks malgré la consigne
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw_text)
+        data = parse_llm_json(raw_text)
         return ParsedCommand(**data)
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         raise HTTPException(

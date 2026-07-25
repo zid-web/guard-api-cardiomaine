@@ -1,9 +1,10 @@
-import os
 import base64
 import json
 from typing import Dict, List, Tuple
 import anthropic
 from fastapi import HTTPException
+
+from llm_json import parse_llm_json
 
 client = anthropic.Anthropic()
 
@@ -79,8 +80,7 @@ PDF analysé (encodé en base64) :
             }],
         )
         raw_text = response.content[0].text
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw_text)
+        data = parse_llm_json(raw_text)
 
         existing_schedule = {}
         for day, activities in data.items():

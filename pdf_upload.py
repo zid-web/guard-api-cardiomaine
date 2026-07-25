@@ -19,19 +19,22 @@ d'être injectée dans le solveur.
 """
 
 import base64
-import io
 import json
-import re
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import anthropic
 
+from llm_json import parse_llm_json
 from solver import map_row_key_to_slot_activity
 
 client = anthropic.Anthropic()
+
+# Les tableaux complets (toutes les lignes + cellules) dépassent souvent 4k tokens.
+# Une troncature mid-JSON provoquait : "Expecting value: line N column M".
+PDF_EXTRACTION_MAX_TOKENS = 16000
 
 # Lignes que le solveur sait gérer (doivent correspondre exactement aux clés
 # utilisées dans solver.map_row_key_to_slot_activity)
@@ -138,43 +141,103 @@ Règles importantes :
 """
 
 
+def _call_claude_vision(image_b64: str, user_text: str, max_tokens: int = PDF_EXTRACTION_MAX_TOKENS):
+    return client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=max_tokens,
+        system=EXTRACTION_SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": user_text,
+                    },
+                ],
+            }
+        ],
+    )
+
+
+def _repair_json_via_claude(broken_text: str) -> dict:
+    """Dernier recours : demander à Claude de renvoyer UNIQUEMENT un JSON valide."""
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=PDF_EXTRACTION_MAX_TOKENS,
+        system=(
+            "Tu répares du JSON malformé. Réponds UNIQUEMENT avec un objet JSON valide, "
+            "sans markdown, sans commentaire. Conserve autant que possible le contenu "
+            "et la structure d'origine (week_label, dates_by_day, rows, warnings)."
+        ),
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Corrige ce JSON pour qu'il soit parseable. "
+                    "Si le texte est tronqué, ferme proprement les structures ouvertes "
+                    "et omets uniquement les cellules incomplètes en fin de réponse.\n\n"
+                    f"{broken_text}"
+                ),
+            }
+        ],
+    )
+    return parse_llm_json(response.content[0].text)
+
+
 def extract_planning_from_pdf(file_bytes: bytes) -> PdfExtractionResult:
     image_b64 = pdf_to_image_base64(file_bytes)
+    raw_text = ""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4000,
-            system=EXTRACTION_SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Extrait ce planning selon le format JSON demandé.",
-                        },
-                    ],
-                }
-            ],
+        response = _call_claude_vision(
+            image_b64,
+            "Extrait ce planning selon le format JSON demandé. "
+            "Réponds UNIQUEMENT avec le JSON complet, sans markdown.",
         )
-        raw_text = response.content[0].text.strip()
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw_text)
+        raw_text = (response.content[0].text or "").strip()
+        stop_reason = getattr(response, "stop_reason", None)
+
+        try:
+            data = parse_llm_json(raw_text)
+        except json.JSONDecodeError:
+            # Si tronqué par max_tokens, retenter une fois avec consigne plus courte
+            if stop_reason == "max_tokens":
+                response = _call_claude_vision(
+                    image_b64,
+                    "Le JSON précédent a été tronqué. Réextrais le planning en JSON COMPLET "
+                    "mais plus compact (raw_text courts, warnings condensés). "
+                    "Réponds UNIQUEMENT avec le JSON.",
+                )
+                raw_text = (response.content[0].text or "").strip()
+                try:
+                    data = parse_llm_json(raw_text)
+                except json.JSONDecodeError:
+                    data = _repair_json_via_claude(raw_text)
+            else:
+                data = _repair_json_via_claude(raw_text)
+
         return PdfExtractionResult(**data)
     except json.JSONDecodeError as e:
         raise HTTPException(
             status_code=422,
             detail=f"Réponse d'extraction invalide (JSON malformé) : {str(e)}"
         )
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Réponse d'extraction invalide (schéma) : {str(e)}"
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=502,

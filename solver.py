@@ -647,7 +647,3 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         assignments=assignments,
         warnings=warnings
     )
-cp /chemin/vers/planning-cardiomaine/guard-api/solver.py .
-git add solver.py
-git commit -m "feat: ATL suit Coro + nuits consécutives W/O/M"
-git push origin main

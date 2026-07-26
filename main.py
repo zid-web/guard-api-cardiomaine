@@ -68,3 +68,13 @@ async def upload_planning_pdf_endpoint(file: UploadFile = File(...), x_api_key: 
         raise HTTPException(status_code=422, detail="Le fichier doit etre un PDF.")
     file_bytes = await file.read()
     return handle_pdf_upload(file_bytes)
+# clone ou pull du backend Render
+cd /path/to/guard-api-cardiomaine
+git pull origin main
+
+# copier au minimum le solveur (et le reste si besoin)
+cp /path/to/planning-cardiomaine/guard-api/solver.py .
+
+git add solver.py
+git commit -m "feat: ATL suit Coro + nuits consécutives W/O/M"
+git push origin main

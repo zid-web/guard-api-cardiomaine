@@ -252,6 +252,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if doc_id in RYTHMO_SCHEDULE and day_name in RYTHMO_SCHEDULE[doc_id] and activity != "RYTHMO":
             return
 
+        # Empêche une contradiction avec la règle de repos après garde de nuit
+        # (section 3bis) : si le LENDEMAIN est un jour RYTHMO forcé pour ce
+        # médecin (matin ET am), le repos automatique essaierait de bloquer un
+        # créneau que RYTHMO force par ailleurs à 1 - contradiction menant à
+        # "Aucune solution trouvée". On évite le conflit à la source en
+        # n'autorisant pas la garde/astreinte de nuit la veille d'un tel jour.
+        if slot == "nuit" and activity in ("GARDE", "ASTREINTE") and d_idx < 6:
+            next_day_name = DAY_NAMES_FR[d_idx + 1]
+            if doc_id in RYTHMO_SCHEDULE and next_day_name in RYTHMO_SCHEDULE[doc_id]:
+                return
+
         if doc_id in fixed_exclusions and d_idx in fixed_exclusions[doc_id]:
             return
 
@@ -570,10 +581,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     if req.previous_sunday_guard_doctor:
         sunday_doc = req.previous_sunday_guard_doctor
         monday_name = DAY_NAMES_FR[0]
-        target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
-        for (doc, d, sl, act), v in x.items():
-            if doc == sunday_doc and d == 0 and sl == target_slot:
-                model.Add(v == 0)
+        # Si RYTHMO est forcé pour ce médecin le lundi, cette règle ne
+        # s'applique pas (RYTHMO prime - règle fixe non négociable, voir
+        # discussion utilisateur) plutôt que de créer une contradiction directe.
+        if not (sunday_doc in RYTHMO_SCHEDULE and monday_name in RYTHMO_SCHEDULE[sunday_doc]):
+            target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
+            for (doc, d, sl, act), v in x.items():
+                if doc == sunday_doc and d == 0 and sl == target_slot:
+                    model.Add(v == 0)
+        else:
+            warnings.append(
+                f"{sunday_doc} a fait la garde de nuit dimanche dernier mais est en RYTHMO "
+                f"forcé ce lundi - repos automatique non appliqué (RYTHMO prime)."
+            )
 
     # --- 4. Structure des astreintes de nuit (Lundi à Vendredi) avec alternance CH/WOM ---
     # week_type: 1 = impaire, 2 = paire
@@ -1015,15 +1035,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if req.previous_sunday_guard_doctor:
             sunday_doc = req.previous_sunday_guard_doctor
             monday_name = DAY_NAMES_FR[0]
-            target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
-            assignments.append(Assignment(
-                date=days[0].isoformat(),
-                day_name=monday_name,
-                slot=target_slot,
-                activity="DEMI_JOURNEE_LIBRE",
-                doctor=sunday_doc,
-                note="Repos après garde de nuit (dimanche précédent)"
-            ))
+            rythmo_takes_priority = (
+                sunday_doc in RYTHMO_SCHEDULE and monday_name in RYTHMO_SCHEDULE[sunday_doc]
+            )
+            if not rythmo_takes_priority:
+                target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
+                assignments.append(Assignment(
+                    date=days[0].isoformat(),
+                    day_name=monday_name,
+                    slot=target_slot,
+                    activity="DEMI_JOURNEE_LIBRE",
+                    doctor=sunday_doc,
+                    note="Repos après garde de nuit (dimanche précédent)"
+                ))
 
         # Ajouter les CH pour les nuits structurelles si manquants
         # On vérifie si CH est présent pour les jours où il est attendu

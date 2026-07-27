@@ -25,9 +25,7 @@
     { "day": "VENDREDI", "slot": "matin", "doctors": ["K"] },
     { "day": "VENDREDI", "slot": "am", "doctors": ["O", "A", "K", "R", "T"] }
   ],
-  "fixed_exclusions": {
-    "S": [0, 4]
-  },
+  "fixed_exclusions": {},
   "nct_fixed_schedule": {
     "2026-07-23": "M",
     "2026-09-10": "M",

@@ -2,8 +2,9 @@
 API REST pour la generation des gardes/astreintes - Planning Cardiomaine
 Point d'entree principal, a deployer (Render, Railway, Fly.io...)
 """
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 import os
 from solver import GenerateWeekRequest, GenerateWeekResponse, generate_week
 from voice_command import VoiceCommandRequest, VoiceCommandResponse, handle_voice_command
@@ -24,9 +25,13 @@ app.add_middleware(
 )
 
 API_KEY = os.environ.get("GUARD_API_KEY", "")
+if not API_KEY:
+    # Ne bloque pas le demarrage (utile en dev), mais le fait savoir clairement
+    # dans les logs Render : sans GUARD_API_KEY definie, l'API reste PUBLIQUE.
+    print("[WARN] GUARD_API_KEY n'est pas definie : l'API est actuellement sans authentification.")
 
 
-def _check_api_key(x_api_key: str):
+def _check_api_key(x_api_key: Optional[str]):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Cle API invalide ou manquante")
 
@@ -37,7 +42,10 @@ def health_check():
 
 
 @app.post("/generate-week", response_model=GenerateWeekResponse)
-def generate_week_endpoint(req: GenerateWeekRequest, x_api_key: str = ""):
+def generate_week_endpoint(
+    req: GenerateWeekRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
     _check_api_key(x_api_key)
     try:
         return generate_week(req)
@@ -46,7 +54,10 @@ def generate_week_endpoint(req: GenerateWeekRequest, x_api_key: str = ""):
 
 
 @app.post("/voice-command", response_model=VoiceCommandResponse)
-def voice_command_endpoint(req: VoiceCommandRequest, x_api_key: str = ""):
+def voice_command_endpoint(
+    req: VoiceCommandRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
     """
     Recoit un texte (transcrit cote navigateur via Web Speech API), l'interprete
     via Claude, applique la contrainte au planning et renvoie le planning recalcule.
@@ -56,7 +67,10 @@ def voice_command_endpoint(req: VoiceCommandRequest, x_api_key: str = ""):
 
 
 @app.post("/upload-planning-pdf", response_model=PdfUploadResponse)
-async def upload_planning_pdf_endpoint(file: UploadFile = File(...), x_api_key: str = ""):
+async def upload_planning_pdf_endpoint(
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
     """
     Recoit un PDF scanne du planning, l'analyse via Claude Vision, et renvoie :
     - l'extraction brute complete (toutes les lignes, pour controle humain)
@@ -67,4 +81,4 @@ async def upload_planning_pdf_endpoint(file: UploadFile = File(...), x_api_key: 
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=422, detail="Le fichier doit etre un PDF.")
     file_bytes = await file.read()
-    return handle_pdf_upload(file_bytes)
+    return await handle_pdf_upload(file_bytes)

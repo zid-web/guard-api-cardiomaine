@@ -714,6 +714,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         else:
                             model.Add(var == 0)
 
+    # --- 4bis. M/O/W ne peuvent jamais faire 2 astreintes de nuit la même
+    # semaine en semaine (lundi-vendredi) - confirmé utilisateur 27/07/2026 :
+    # "jamais 2 fois le même médecin", total sur la semaine (pas seulement
+    # consécutif). Le weekend (samedi/dimanche) est explicitement exempté de
+    # cette règle - un même médecin WOM peut y être présent sans que ça compte.
+    for doc in wom_pool:
+        weekday_night_vars = [
+            v for (d_op, d, sl, act), v in x.items()
+            if d_op == doc and d < 5 and sl == "nuit" and act == "ASTREINTE"
+        ]
+        if weekday_night_vars:
+            model.Add(sum(weekday_night_vars) <= 1)
+
     # --- 5. NCT (jeudi nuit) ---
     thursday_iso = days[3].isoformat()
     nct_vars = [v for (doc, d, sl, act), v in x.items() if d == 3 and sl == "nuit" and act == "NCT"]

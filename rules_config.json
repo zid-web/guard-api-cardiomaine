@@ -1,0 +1,37 @@
+{
+  "wom_pool": ["W", "O", "M"],
+  "reeduc_allowed": ["Z", "B", "S", "G", "H"],
+  "reeduc_days": ["LUNDI", "MERCREDI", "VENDREDI"],
+  "coro_allowed": ["W", "M", "O", "FV"],
+  "rythmo_allowed": ["A", "U", "P"],
+  "rythmo_schedule": {
+    "P": ["MARDI"],
+    "U": ["MERCREDI"],
+    "A": ["LUNDI", "JEUDI"]
+  },
+  "nct_allowed": ["M", "W"],
+  "garde_allowed": ["A", "Z", "B", "G", "S", "H", "M", "W", "O", "P", "U"],
+  "half_days_off": [
+    { "day": "MARDI", "slot": "am", "doctors": ["S"] },
+    { "day": "MERCREDI", "slot": "am", "doctors": ["M", "W", "G", "Z", "H"] },
+    { "day": "JEUDI", "slot": "am", "doctors": ["U", "S", "P"] },
+    { "day": "VENDREDI", "slot": "am", "doctors": ["O", "A", "K", "R", "T"] }
+  ],
+  "fixed_exclusions": {
+    "S": [0, 4]
+  },
+  "nct_fixed_schedule": {
+    "2026-07-23": "M",
+    "2026-09-10": "M",
+    "2026-09-17": "W",
+    "2026-09-24": "M",
+    "2026-10-01": "W",
+    "2026-10-15": "M",
+    "2026-10-29": "W",
+    "2026-11-05": "M",
+    "2026-11-19": "W",
+    "2026-11-26": "M",
+    "2026-12-03": "W",
+    "2026-12-17": "M"
+  }
+}

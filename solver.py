@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from typing import List, Dict, Optional, Literal, Set, Tuple, Any
 from pydantic import BaseModel
 import enum
+import re
 
 from config import load_default_rules, merge_rules, half_days_off_as_dict, fixed_exclusions_as_dict
 
@@ -149,17 +150,60 @@ def map_row_key_to_slot_activity(row_key: str) -> Tuple[Optional[str], Optional[
 
 def map_historical_row_key_to_slot(row_key: str) -> Optional[str]:
     """Mapper générique pour les activités hors solveur restant basées sur la
-    fréquence historique (Cs, ETT, EE...). Les activités "Hors site - X" ont
-    leurs propres règles fixes (voir HORS_SITE_CONFIG plus bas) - pas de
-    mapping générique ici pour elles, gérées séparément.
+    fréquence historique (Cs, ETT, EE, Stress...). Les activités "Hors site - X"
+    ont leurs propres règles fixes (voir HORS_SITE_CONFIG) - pas de mapping
+    générique ici pour elles, gérées séparément.
     """
+    if not is_solver_historical_row_key(row_key):
+        return None
     if row_key.startswith("Matin - "):
         return "matin"
     if row_key.startswith("Apm - "):
         return "am"
-    if row_key in ("Entrées PSS", "Pré-op"):
-        return "am"  # confirmé par l'utilisateur (26/07/2026)
     return None
+
+
+# Lignes structurelles / hors fidélité historique (½-off, Visite, hors site,
+# solveur classique...) : ignorées silencieusement dans historical_patterns,
+# pas de warning "non reconnu" pour elles - elles sont gérées ailleurs dans
+# le solveur ou ne concernent pas la fidélité historique.
+HISTORICAL_PATTERNS_SKIP_ROW_KEYS = {
+    "1/2 journée off Matin",
+    "1/2 journée off Après-midi",
+    "Matin - Visite",
+    "Hors site - CDL",
+    "Hors site - IRM",
+    "Hors site - Scinti",
+    "Hors site - LFB",
+    "Hors site - PSSL",
+    "Apm - RÉEDUCATION",
+    "Pré-op",
+    "Entrées PSS",
+    "Notes du jour",
+    "Congrès",
+    "Congés",
+    "Vacances",
+    "Matin - Rythmo",
+    "Apm - Rythmo",
+    "Matin - Coro",
+    "Apm - Coro",
+    "Garde Matin",
+    "Garde Midi",
+    "Garde Nuit",
+    "Astreintes ATL Matin",
+    "Astreintes ATL Midi",
+    "Astreintes ATL Nuit",
+    "Hors site - NCT",
+}
+
+
+def is_solver_historical_row_key(row_key: str) -> bool:
+    """Allowlist Cs / ETT / EE / Stress uniquement (fidélité historique) -
+    tout le reste (activités déjà gérées par des règles dures, ou hors
+    périmètre) est explicitement exclu plutôt que deviné par préfixe seul."""
+    if row_key in HISTORICAL_PATTERNS_SKIP_ROW_KEYS or row_key in HORS_SITE_CONFIG:
+        return False
+    return bool(re.match(r"^(Matin|Apm) - (Cs |ETT |EE\d|Stress$)", row_key))
 
 
 # Règles fixes hors site (confirmées avec l'utilisateur le 26/07/2026, PAS
@@ -194,7 +238,20 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     REEDUC_DAYS = set(rules["reeduc_days"])
     CORO_ALLOWED = set(rules["coro_allowed"])
     RYTHMO_ALLOWED = set(rules["rythmo_allowed"])
-    RYTHMO_SCHEDULE: Dict[str, set] = {doc: set(days) for doc, days in rules.get("rythmo_schedule", {}).items()}
+    RYTHMO_SCHEDULE: Dict[str, set] = {doc: set(d) for doc, d in rules.get("rythmo_schedule", {}).items()}
+    # Créneaux (matin/am) par médecin, séparés du jour - permet à chacun d'avoir
+    # un créneau différent (P=matin+am, U/A=am seul). Défaut matin+am si absent
+    # du JSON, pour rester rétrocompatible avec d'anciennes configs.
+    RYTHMO_SLOTS: Dict[str, Tuple[str, ...]] = {
+        doc: tuple(slots) for doc, slots in rules.get("rythmo_slots", {}).items()
+    }
+    # Vendredi : alternance P/U selon la semaine (confirmé utilisateur 27/07/2026).
+    # Traité à PART du mécanisme générique RYTHMO_SCHEDULE/RYTHMO_SLOTS (qui suppose
+    # un créneau uniforme par médecin sur tous ses jours) car P a besoin de
+    # matin+am le mardi mais SEULEMENT matin le vendredi - un seul et même médecin,
+    # deux créneaux différents selon le jour. Voir section 6bis pour le forçage.
+    rythmo_vendredi_doctor = "P" if req.week_type == 1 else "U"
+    rythmo_vendredi_slot = "matin" if req.week_type == 1 else "am"
     NCT_ALLOWED = set(rules["nct_allowed"])
     NCT_FIXED_SCHEDULE = rules["nct_fixed_schedule"]
     GARDE_ALLOWED = set(rules.get("garde_allowed", []))  # vide = pas de restriction (rétro-compatible)
@@ -228,6 +285,16 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model = cp_model.CpModel()
     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
 
+    def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
+        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
+            return True
+        return doc_id in RYTHMO_SCHEDULE and day_name in RYTHMO_SCHEDULE[doc_id]
+
+    def _rythmo_slots_for(doc_id: str, day_name: str) -> Tuple[str, ...]:
+        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
+            return (rythmo_vendredi_slot,)
+        return RYTHMO_SLOTS.get(doc_id, ("matin", "am"))
+
     def add_var_if_allowed(doc_id: str, d_idx: int, slot: str, activity: str):
         day = days[d_idx]
         if is_on_vacation(doc_id, day, req.vacations):
@@ -245,23 +312,27 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if (day_name, slot) in half_days_off and doc_id in half_days_off[(day_name, slot)]:
             return
 
-        # RYTHMO par jour précis (P=mardi, U=mercredi, A=lundi+jeudi) : ce médecin
-        # est exclu de TOUTE AUTRE activité son jour de rythmo (fixed_exclusions
-        # gérait auparavant ça en bloquant tout, RYTHMO inclus - corrigé ici pour
-        # que RYTHMO reste possible/forcé ce jour-là, voir contrainte plus bas).
-        if doc_id in RYTHMO_SCHEDULE and day_name in RYTHMO_SCHEDULE[doc_id] and activity != "RYTHMO":
+        # RYTHMO : exclusion des AUTRES activités uniquement sur le(s) créneau(x)
+        # réellement occupé par RYTHMO (précision par médecin - P=matin+am,
+        # U/A=am seul, vendredi=1 seul créneau en alternance). Les autres
+        # créneaux du même jour restent disponibles pour d'autres activités.
+        if _is_rythmo_day(doc_id, day_name) and slot in _rythmo_slots_for(doc_id, day_name) and activity != "RYTHMO":
             return
 
         # Empêche une contradiction avec la règle de repos après garde de nuit
-        # (section 3bis) : si le LENDEMAIN est un jour RYTHMO forcé pour ce
-        # médecin (matin ET am), le repos automatique essaierait de bloquer un
-        # créneau que RYTHMO force par ailleurs à 1 - contradiction menant à
-        # "Aucune solution trouvée". On évite le conflit à la source en
-        # n'autorisant pas la garde/astreinte de nuit la veille d'un tel jour.
+        # (section 3bis) : si le LENDEMAIN a un créneau RYTHMO forcé pour ce
+        # médecin QUI CHEVAUCHE le créneau cible du repos automatique, celui-ci
+        # essaierait de bloquer un créneau que RYTHMO force par ailleurs à 1 -
+        # contradiction menant à "Aucune solution trouvée". On évite le conflit
+        # à la source, mais UNIQUEMENT si les créneaux se chevauchent réellement
+        # (ex: A ne fait Rythmo que l'am, donc une garde nuit la veille reste OK
+        # si le repos cible le matin).
         if slot == "nuit" and activity in ("GARDE", "ASTREINTE") and d_idx < 6:
             next_day_name = DAY_NAMES_FR[d_idx + 1]
-            if doc_id in RYTHMO_SCHEDULE and next_day_name in RYTHMO_SCHEDULE[doc_id]:
-                return
+            if _is_rythmo_day(doc_id, next_day_name):
+                target_off = target_off_slot_after_night_guard(doc_id, next_day_name)
+                if target_off in _rythmo_slots_for(doc_id, next_day_name):
+                    return
 
         if doc_id in fixed_exclusions and d_idx in fixed_exclusions[doc_id]:
             return
@@ -275,9 +346,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if activity == "RYTHMO":
             if doc_id not in RYTHMO_ALLOWED:
                 return
-            # Un médecin du pool RYTHMO ne fait rythmo QUE son jour désigné
-            # (ex: P ne fait jamais rythmo un autre jour que mardi).
-            if doc_id in RYTHMO_SCHEDULE and day_name not in RYTHMO_SCHEDULE[doc_id]:
+            # Un médecin du pool RYTHMO ne fait rythmo QUE son jour + créneau désignés
+            # (ex: P ne fait jamais rythmo un autre jour que mardi, ni le matin
+            # un jour où seul l'après-midi est prévu).
+            if not _is_rythmo_day(doc_id, day_name):
+                return
+            if slot not in _rythmo_slots_for(doc_id, day_name):
                 return
         if activity == "NCT" and (doc_id not in NCT_ALLOWED or d_idx != 3):
             return
@@ -392,6 +466,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             # Entrées PSS a ses propres règles dédiées (voir 2quater) : roulement
             # lundi/mardi parmi le pool clinique, jumelé au garde de l'après-midi
             # mercredi/jeudi/vendredi.
+            continue
+
+        # ½-off / Visite / Rythmo / Coro / Garde / Astreinte / NCT... : hors
+        # périmètre de la fidélité historique (gérées par des règles dures
+        # ailleurs) - ignorées silencieusement, pas de warning "non reconnu"
+        # pour ce qui est normal et attendu.
+        if not is_solver_historical_row_key(row_key):
             continue
 
         slot = map_historical_row_key_to_slot(row_key)
@@ -581,18 +662,20 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     if req.previous_sunday_guard_doctor:
         sunday_doc = req.previous_sunday_guard_doctor
         monday_name = DAY_NAMES_FR[0]
-        # Si RYTHMO est forcé pour ce médecin le lundi, cette règle ne
-        # s'applique pas (RYTHMO prime - règle fixe non négociable, voir
-        # discussion utilisateur) plutôt que de créer une contradiction directe.
-        if not (sunday_doc in RYTHMO_SCHEDULE and monday_name in RYTHMO_SCHEDULE[sunday_doc]):
-            target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
+        # Si RYTHMO est forcé sur le créneau de repos ciblé lundi, cette règle
+        # ne s'applique pas (RYTHMO prime) - mais uniquement en cas de
+        # chevauchement réel de créneau (ex: A ne fait Rythmo que l'am, donc
+        # un repos matin reste appliqué normalement).
+        target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
+        rythmo_blocks_off = _is_rythmo_day(sunday_doc, monday_name) and target_slot in _rythmo_slots_for(sunday_doc, monday_name)
+        if not rythmo_blocks_off:
             for (doc, d, sl, act), v in x.items():
                 if doc == sunday_doc and d == 0 and sl == target_slot:
                     model.Add(v == 0)
         else:
             warnings.append(
                 f"{sunday_doc} a fait la garde de nuit dimanche dernier mais est en RYTHMO "
-                f"forcé ce lundi - repos automatique non appliqué (RYTHMO prime)."
+                f"forcé ce lundi ({target_slot}) - repos automatique non appliqué (RYTHMO prime)."
             )
 
     # --- 4. Structure des astreintes de nuit (Lundi à Vendredi) avec alternance CH/WOM ---
@@ -690,22 +773,28 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             else:
                 warnings.append(f"FV : créneau {DAY_NAMES_FR[d_idx]} {slot} {act} non disponible")
 
-    # --- 6bis. RYTHMO forcé (matin + après-midi) le jour désigné de chaque médecin ---
-    # (P=mardi, U=mercredi, A=lundi+jeudi - voir rythmo_schedule dans rules_config.json).
-    # Contrairement à GARDE/CORO qui restent "possibles", le document métier précise
-    # explicitement "Rythmo mardi matin+AM" pour P : c'est une activité fixe
-    # récurrente, pas une option laissée au solveur.
+    # --- 6bis. RYTHMO forcé sur le(s) créneau(x) exact(s) par jour/médecin ---
+    # A = après-midi seulement (lundi, jeudi) ; P = matin+après-midi (mardi) ;
+    # U = matin+après-midi (mercredi) ; vendredi = alternance P/U selon
+    # week_type, un seul créneau (voir rythmo_schedule/rythmo_slots dans
+    # rules_config.json + rythmo_vendredi_doctor/slot ci-dessus). Confirmé
+    # précisément avec l'utilisateur le 27/07/2026.
+    def _force_rythmo(doc_id: str, day_name: str, slot: str):
+        d_idx = DAY_NAMES_FR.index(day_name)
+        var = x.get((doc_id, d_idx, slot, "RYTHMO"))
+        if var is not None:
+            model.Add(var == 1)
+        else:
+            warnings.append(
+                f"RYTHMO {doc_id} non disponible {day_name} {slot} (vacances/congé ce jour-là ?)"
+            )
+
     for doc_id, rythmo_days in RYTHMO_SCHEDULE.items():
         for day_name in rythmo_days:
-            d_idx = DAY_NAMES_FR.index(day_name)
-            for slot in ("matin", "am"):
-                var = x.get((doc_id, d_idx, slot, "RYTHMO"))
-                if var is not None:
-                    model.Add(var == 1)
-                else:
-                    warnings.append(
-                        f"RYTHMO {doc_id} non disponible {day_name} {slot} (vacances/congé ce jour-là ?)"
-                    )
+            for slot in RYTHMO_SLOTS.get(doc_id, ("matin", "am")):
+                _force_rythmo(doc_id, day_name, slot)
+
+    _force_rythmo(rythmo_vendredi_doctor, "VENDREDI", rythmo_vendredi_slot)
 
     # --- 7. Règles d'exclusion métier ---
     # 7.1 AM OFF après garde nuit (lendemain matin)
@@ -1035,11 +1124,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if req.previous_sunday_guard_doctor:
             sunday_doc = req.previous_sunday_guard_doctor
             monday_name = DAY_NAMES_FR[0]
+            target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
             rythmo_takes_priority = (
-                sunday_doc in RYTHMO_SCHEDULE and monday_name in RYTHMO_SCHEDULE[sunday_doc]
+                _is_rythmo_day(sunday_doc, monday_name) and target_slot in _rythmo_slots_for(sunday_doc, monday_name)
             )
             if not rythmo_takes_priority:
-                target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
                 assignments.append(Assignment(
                     date=days[0].isoformat(),
                     day_name=monday_name,

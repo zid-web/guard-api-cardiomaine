@@ -48,12 +48,32 @@ class Vacation(BaseModel):
     start_date: str
     end_date: str
 
+class RoomMaintenance(BaseModel):
+    """Salle de coronarographie indisponible sur une période - bloque CORO
+    pour TOUS les médecins concernés (M, O, W, FV), pas un médecin en
+    particulier, mais UNIQUEMENT sur le(s) créneau(x) réellement en
+    maintenance (ex: après-midi seul, pas forcément matin+après-midi)."""
+    start_date: str
+    end_date: str
+    slots: List[str] = ["matin", "am"]  # sous-ensemble concerné, ex: ["am"] seul
+    reason: Optional[str] = None  # ex: "maintenance", informationnel uniquement
+
+class PartialAbsence(BaseModel):
+    """Absence ponctuelle d'un médecin sur un/des créneau(x) précis d'une seule
+    journée - granularité plus fine qu'une Vacation (qui bloque la journée
+    entière). Ex: S absent jeudi matin seulement."""
+    doctor_id: str
+    date: str  # YYYY-MM-DD, un seul jour (pas de plage - "ponctuelle")
+    slots: List[str]  # sous-ensemble de ["matin", "am", "nuit"]
+
 class GenerateWeekRequest(BaseModel):
     week_start_date: str              # YYYY-MM-DD (lundi)
     week_type: int                    # 1 = impaire, 2 = paire
     medecins: List[Medecin]
     vacations: List[Vacation] = []
     congres: List[Vacation] = []      # même structure que vacations : doctor_id, start_date, end_date
+    room_maintenance: List[RoomMaintenance] = []  # salle de coro indisponible sur une période
+    partial_absences: List[PartialAbsence] = []   # absence ponctuelle par créneau précis (voir modèle ci-dessus)
     weekend_mode: Literal["CH", "ROTATION"] = "ROTATION"
     last_nct_doctor: Optional[str] = None  # W ou M
     previous_sunday_guard_doctor: Optional[str] = None  # médecin ayant fait la garde/astreinte
@@ -122,6 +142,28 @@ def is_on_vacation(doctor_id: str, day: date, vacations: List[Vacation]) -> bool
             end = date.fromisoformat(v.end_date)
             if start <= day <= end:
                 return True
+    return False
+
+
+def is_room_under_maintenance(day: date, slot: str, room_maintenance: List["RoomMaintenance"]) -> bool:
+    """Salle de coro indisponible ce jour-là ET ce créneau précis (matin et
+    après-midi peuvent être affectés indépendamment) - bloque CORO pour tout
+    le monde sur ce seul créneau."""
+    for m in room_maintenance:
+        start = date.fromisoformat(m.start_date)
+        end = date.fromisoformat(m.end_date)
+        if start <= day <= end and slot in m.slots:
+            return True
+    return False
+
+
+def is_partially_absent(doctor_id: str, day: date, slot: str, partial_absences: List["PartialAbsence"]) -> bool:
+    """Absence ponctuelle sur un créneau précis (granularité plus fine qu'une
+    Vacation) - ex: S absent jeudi matin seulement, disponible l'après-midi."""
+    day_iso = day.isoformat()
+    for pa in partial_absences:
+        if pa.doctor_id == doctor_id and pa.date == day_iso and slot in pa.slots:
+            return True
     return False
 
 def jours_semaine(week_start: date) -> List[date]:
@@ -237,6 +279,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # --- 0. Chargement des règles (défaut JSON + surcharge éventuelle du front) ---
     rules = merge_rules(load_default_rules(), req.rules_override)
     REEDUC_ALLOWED = set(rules["reeduc_allowed"])
+    REEDUC_ALLOWED_EXTRA_BY_DAY: Dict[str, set] = {
+        day: set(docs) for day, docs in rules.get("reeduc_allowed_extra_by_day", {}).items()
+    }
     REEDUC_DAYS = set(rules["reeduc_days"])
     CORO_ALLOWED = set(rules["coro_allowed"])
     RYTHMO_ALLOWED = set(rules["rythmo_allowed"])
@@ -302,6 +347,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if is_on_vacation(doc_id, day, req.vacations):
             return
 
+        if is_partially_absent(doc_id, day, slot, req.partial_absences):
+            return
+
+        if activity == "CORO" and is_room_under_maintenance(day, slot, req.room_maintenance):
+            return
+
         if doc_id in (daas_id, d_id):
             return
 
@@ -341,7 +392,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
         # Restrictions explicites par code médecin (priment sur les règles par statut)
         if activity == "REEDUC":
-            if day_name not in REEDUC_DAYS or slot != "am" or doc_id not in REEDUC_ALLOWED:
+            if day_name not in REEDUC_DAYS or slot != "am":
+                return
+            eligible_today = REEDUC_ALLOWED | REEDUC_ALLOWED_EXTRA_BY_DAY.get(day_name, set())
+            if doc_id not in eligible_today:
                 return
         if activity == "CORO" and doc_id not in CORO_ALLOWED:
             return

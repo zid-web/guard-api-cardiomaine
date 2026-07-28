@@ -1,0 +1,25 @@
+{
+  "clinical_eligibility": {
+    "echo": ["A", "H", "W", "B", "Z", "K", "P", "R", "G", "S", "M", "O", "V"],
+    "ee": ["A", "H", "W", "B", "O", "T", "Z", "K", "U", "V", "G", "S", "M", "R"],
+    "stress": ["A", "H", "B", "Z", "K", "G", "S"],
+    "eto": ["H", "Z", "G"],
+    "coro": ["W", "M", "O", "FV"],
+    "rythmo": ["A", "U", "P"],
+    "reeduc": ["Z", "B", "S", "G", "H", "K", "R"],
+    "controle_pm": ["A", "U", "P"],
+    "irm": ["S"],
+    "scinti": ["T", "R"],
+    "cs_tesse": ["B", "S", "V", "U"]
+  },
+  "doc022_fixed_slots": [
+    { "row_key": "Matin - ETT salle 1", "day_name": "LUNDI", "doctor": "P", "note": "ECHO1 Poret" },
+    { "row_key": "Apm - ETT salle 1", "day_name": "MERCREDI", "doctor": "S", "note": "ECHO enfants Saint André" },
+    { "row_key": "Matin - EE2", "day_name": "LUNDI", "doctor": "V", "note": "EE2 Lefebvre" },
+    { "row_key": "Matin - EE2", "day_name": "VENDREDI", "doctor": "O", "note": "EE2 Bros" },
+    { "row_key": "Hors site - Scinti", "day_name": "LUNDI", "doctor": "T", "note": "Scinti Cloitre" },
+    { "row_key": "Hors site - Scinti", "day_name": "MERCREDI", "doctor": "T", "note": "Scinti Cloitre" },
+    { "row_key": "Hors site - Scinti", "day_name": "MARDI", "doctor": "R", "note": "Scinti Rousseau" }
+  ],
+  "comment": "Addon DOC022 — merger dans rules_config.json de guard-api-cardiomaine. Le front envoie déjà ces clés via rules_override."
+}

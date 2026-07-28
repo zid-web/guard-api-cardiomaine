@@ -92,6 +92,10 @@ class GenerateWeekRequest(BaseModel):
                                           # rotation à 3 semaines ne s'aligne pas mécaniquement avec la
                                           # parité paire/impaire, un ajustement humain est nécessaire).
                                           # Conséquence : pas de Cs le matin cette semaine pour ce médecin.
+    lfb_doctor: Optional[str] = None  # H, S ou G : qui fait LFB ce jeudi (roulement 1/3, désigné en
+                                       # entrée comme visite_doctor - même raisonnement).
+    pssl_b_active: bool = False  # B fait PSSL ce jeudi (roulement 1/3, désigné en entrée)
+    pssl_z_active: bool = False  # Z fait PSSL ce mardi (roulement 1/2, désigné en entrée)
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -269,13 +273,33 @@ def is_solver_historical_row_key(row_key: str) -> bool:
 #   pas via une exclusion a priori, pour laisser le solveur choisir O si H est
 #   occupé par autre chose ce jour précis).
 HORS_SITE_CONFIG = {
+    # IRM : créneaux fixes (lundi matin, vendredi après-midi), S uniquement,
+    # non-exclusif (S peut cumuler une autre activité sauf Cs/ETT/Stress).
     "Hors site - IRM":    {"allowed": ["S"], "full_day": False,
-                            "fixed_slots": [("LUNDI", "matin"), ("VENDREDI", "am")],
-                            "non_exclusive": True},  # S peut cumuler une autre activité sur ce créneau (sauf Cs/ETT/Stress)
-    "Hors site - Scinti": {"allowed": ["R", "T"],      "full_day": False},
-    "Hors site - CDL":    {"allowed": ["V", "O"],      "full_day": False, "priority": ["V", "O"]},
-    "Hors site - LFB":    {"allowed": ["H", "S", "G"], "full_day": True},
-    "Hors site - PSSL":   {"allowed": ["Z", "B"],      "full_day": True},
+                            "fixed_slots_by_doctor": {"S": [("LUNDI", "matin"), ("VENDREDI", "am")]},
+                            "non_exclusive": True},
+    # Scinti : créneaux fixes par médecin (confirmé utilisateur 28/07/2026) -
+    # R mardi matin uniquement, T lundi+mercredi matin uniquement. Remplace
+    # l'ancien modèle "n'importe quel jour, optionnel".
+    "Hors site - Scinti": {"allowed": ["R", "T"], "full_day": False,
+                            "fixed_slots_by_doctor": {
+                                "R": [("MARDI", "matin")],
+                                "T": [("LUNDI", "matin"), ("MERCREDI", "matin")],
+                            }},
+    # CDL : mardi matin uniquement (confirmé utilisateur 28/07/2026, remplace
+    # "n'importe quel jour"), V prioritaire, O en repli si V indisponible.
+    "Hors site - CDL":    {"allowed": ["V", "O"], "full_day": False,
+                            "fixed_slots_by_doctor": {
+                                "V": [("MARDI", "matin")],
+                                "O": [("MARDI", "matin")],
+                            },
+                            "priority": ["V", "O"]},
+    # LFB et PSSL : rotations à référence externe (1 semaine sur 3 / 1 jeudi
+    # sur 3 / 1 mardi sur 2) - PAS gérées ici, désignées en entrée comme
+    # VISITE (voir lfb_doctor / pssl_b_active / pssl_z_active plus bas dans
+    # generate_week, confirmé utilisateur 28/07/2026 : même logique que
+    # VISITE, une rotation à 3 ne s'aligne pas mécaniquement, ajustement
+    # humain nécessaire).
 }
 
 # ============================================================
@@ -485,36 +509,59 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         allowed = config["allowed"]
         full_day = config["full_day"]
         priority = config.get("priority", [])
-        fixed_slots = config.get("fixed_slots")
+        fixed_slots_by_doctor = config.get("fixed_slots_by_doctor")
         activity_name = f"HORSSITE::{row_key}"
 
-        if fixed_slots:
-            # Créneaux fixes forcés (ex: IRM lundi matin + vendredi am, ne
-            # changent jamais) - un seul médecin autorisé attendu, forcé ==1,
-            # PAS un choix optionnel comme les autres activités hors site.
+        if fixed_slots_by_doctor:
+            # Créneaux fixes forcés par médecin (ex: Scinti R=mardi matin,
+            # T=lundi+mercredi matin ; CDL V=mardi matin avec repli O). Un
+            # seul médecin authentiquement présent par (jour, créneau) - si
+            # plusieurs médecins ont le même (jour, créneau) fixe (ex: CDL
+            # V et O tous les deux "mardi matin"), la priorité (config
+            # "priority") désigne qui gagne réellement, l'autre reste à 0
+            # ce jour-là (repli seulement si le prioritaire est absent).
             non_exclusive = config.get("non_exclusive", False)
-            for day_name, slot in fixed_slots:
+            priority = config.get("priority", [])
+
+            # Regrouper par (day_name, slot) -> liste de médecins concernés
+            slot_candidates: Dict[tuple, List[str]] = {}
+            for doc_id, slots in fixed_slots_by_doctor.items():
+                for day_name, slot in slots:
+                    slot_candidates.setdefault((day_name, slot), []).append(doc_id)
+
+            for (day_name, slot), candidates in slot_candidates.items():
                 d_idx = DAY_NAMES_FR.index(day_name)
-                for doc_id in allowed:
+                # Ordonner selon la priorité si définie, sinon ordre donné
+                ordered = sorted(
+                    candidates,
+                    key=lambda d: priority.index(d) if d in priority else len(priority)
+                ) if priority else candidates
+
+                winner = None
+                for doc_id in ordered:
                     if doc_id not in medecins_map:
                         continue
                     if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
-                        warnings.append(
-                            f"{row_key} : {doc_id} en congé le {day_name} - créneau fixe non couvert cette semaine."
-                        )
+                        continue
+                    winner = doc_id
+                    break
+
+                if winner is None:
+                    warnings.append(
+                        f"{row_key} : aucun médecin disponible le {day_name} {slot} "
+                        f"(congé de tous les candidats) - créneau fixe non couvert cette semaine."
+                    )
+                    continue
+
+                for doc_id in candidates:
+                    if doc_id not in medecins_map:
                         continue
                     var = model.NewBoolVar(f"horssite_{doc_id}_{d_idx}_{row_key}")
                     x[(doc_id, d_idx, slot, activity_name)] = var
-                    model.Add(var == 1)  # forcé, pas optionnel
-                    if full_day:
+                    model.Add(var == (1 if doc_id == winner else 0))
+                    if full_day and doc_id == winner:
                         full_day_hors_site_vars.append((doc_id, d_idx, var))
-                    if non_exclusive:
-                        # Ce créneau ne bloque PAS l'exclusivité "une activité par
-                        # créneau" - le médecin peut cumuler une autre activité en
-                        # même temps (ex: garde), SAUF Cs/ETT/Stress (confirmé
-                        # utilisateur 28/07/2026). L'exclusion Cs/ETT/Stress est
-                        # appliquée plus tard (section 2bis pas encore exécutée à
-                        # ce stade, ces variables n'existent pas encore).
+                    if non_exclusive and doc_id == winner:
                         non_exclusive_activities.add(activity_name)
                         irm_non_exclusive_pending.append((doc_id, d_idx, slot, var))
             continue
@@ -548,6 +595,42 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if day_vars:
                 model.Add(sum(day_vars.values()) <= 1)
                 hors_site_vars[(row_key, d_idx)] = day_vars
+
+    # --- LFB / PSSL : rotations désignées en entrée (voir req.lfb_doctor /
+    # pssl_b_active / pssl_z_active) - PAS calculées par le solveur (même
+    # raisonnement que VISITE). Toutes deux "journée entière" (bloquent aussi
+    # l'après-midi, cf. full_day_hors_site_vars).
+    if req.lfb_doctor:
+        jeudi_idx = DAY_NAMES_FR.index("JEUDI")
+        if req.lfb_doctor not in ("H", "S", "G"):
+            warnings.append(f"lfb_doctor '{req.lfb_doctor}' invalide (attendu H, S ou G) - ignoré.")
+        elif is_on_vacation(req.lfb_doctor, days[jeudi_idx], req.vacations) or is_on_vacation(req.lfb_doctor, days[jeudi_idx], req.congres):
+            warnings.append(f"LFB : {req.lfb_doctor} en congé ce jeudi - créneau non couvert cette semaine.")
+        elif req.lfb_doctor in medecins_map:
+            var = model.NewBoolVar(f"lfb_{req.lfb_doctor}_{jeudi_idx}")
+            x[(req.lfb_doctor, jeudi_idx, "matin", "HORSSITE::Hors site - LFB")] = var
+            model.Add(var == 1)
+            full_day_hors_site_vars.append((req.lfb_doctor, jeudi_idx, var))
+
+    if req.pssl_b_active:
+        jeudi_idx = DAY_NAMES_FR.index("JEUDI")
+        if is_on_vacation("B", days[jeudi_idx], req.vacations) or is_on_vacation("B", days[jeudi_idx], req.congres):
+            warnings.append("PSSL : B en congé ce jeudi - créneau non couvert cette semaine.")
+        elif "B" in medecins_map:
+            var = model.NewBoolVar("pssl_b")
+            x[("B", jeudi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
+            model.Add(var == 1)
+            full_day_hors_site_vars.append(("B", jeudi_idx, var))
+
+    if req.pssl_z_active:
+        mardi_idx = DAY_NAMES_FR.index("MARDI")
+        if is_on_vacation("Z", days[mardi_idx], req.vacations) or is_on_vacation("Z", days[mardi_idx], req.congres):
+            warnings.append("PSSL : Z en congé ce mardi - créneau non couvert cette semaine.")
+        elif "Z" in medecins_map:
+            var = model.NewBoolVar("pssl_z")
+            x[("Z", mardi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
+            model.Add(var == 1)
+            full_day_hors_site_vars.append(("Z", mardi_idx, var))
 
     historical_vars: Dict[tuple, Any] = {}  # (row_key, d_idx) -> {doc_id: (BoolVar, frequency)}
     historical_patterns = req.historical_patterns or {}

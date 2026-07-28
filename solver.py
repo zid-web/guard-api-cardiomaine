@@ -86,6 +86,12 @@ class GenerateWeekRequest(BaseModel):
                                                           # sert à forcer son 1/2 journée off ce lundi
                                                           # (règle métier: "Garde de nuit dimanche ->
                                                           # 1/2 journée off lundi, appliquée systématiquement")
+    visite_doctor: Optional[str] = None  # A, B ou U : qui est en semaine de VISITE cette semaine
+                                          # (roulement 1 semaine sur 3, désigné en entrée - pas calculé
+                                          # par le solveur, voir discussion utilisateur 28/07/2026 : la
+                                          # rotation à 3 semaines ne s'aligne pas mécaniquement avec la
+                                          # parité paire/impaire, un ajustement humain est nécessaire).
+                                          # Conséquence : pas de Cs le matin cette semaine pour ce médecin.
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -310,6 +316,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             (ven_doc, "VENDREDI", "matin"),
         ]
     NCT_ALLOWED = set(rules["nct_allowed"])
+    # Restriction Cs PSS vs Cs Tessée par médecin (confirmé utilisateur
+    # 28/07/2026, exclusion stricte pour les 13 médecins concernés).
+    CS_TYPE_ALLOWED: Dict[str, str] = rules.get("cs_type_allowed", {})
     # ATL Matin/Midi/Soir = coronarographistes uniquement (M, O, W, FV, CH),
     # confirmé via DOC022 (28/07/2026) - PAS un pool large de PERMANENT.
     ASTREINTE_ALLOWED = set(rules.get("astreinte_allowed") or (list(CORO_ALLOWED) + ["CH"]))
@@ -576,6 +585,18 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if doc_id not in medecins_map:
                     continue  # médecin externe/inactif, pas dans la requête courante
                 if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
+                    continue
+                # Restriction Cs PSS vs Cs Tessée (confirmé utilisateur 28/07/2026)
+                if row_key.endswith("Cs PSS") and CS_TYPE_ALLOWED.get(doc_id) == "Tessee":
+                    continue
+                if row_key.endswith("Cs Tessée") and CS_TYPE_ALLOWED.get(doc_id) == "PSS":
+                    continue
+                # VISITE (A/B/U en roulement, désigné en entrée) : pas de Cs le
+                # matin cette semaine pour le médecin en visite (confirmé
+                # utilisateur 28/07/2026). Ne s'applique qu'au matin, pas
+                # après-midi, et qu'aux lignes "Cs" (pas ETT/Stress/EE).
+                if (req.visite_doctor and doc_id == req.visite_doctor
+                        and slot == "matin" and row_key.startswith("Matin - Cs")):
                     continue
                 var = model.NewBoolVar(f"hist_{doc_id}_{d_idx}_{row_key}")
                 x[(doc_id, d_idx, slot, activity_name)] = var

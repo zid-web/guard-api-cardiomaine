@@ -6,6 +6,11 @@
   },
   "reeduc_days": ["LUNDI", "MERCREDI", "VENDREDI"],
   "coro_allowed": ["W", "M", "O", "FV"],
+  "astreinte_allowed": ["M", "O", "W", "CH"],
+  "cs_type_allowed": {
+    "A": "PSS", "O": "PSS", "G": "PSS", "M": "PSS", "W": "PSS", "Z": "PSS", "H": "PSS", "P": "PSS",
+    "B": "Tessee", "S": "Tessee", "U": "Tessee", "T": "Tessee", "V": "Tessee"
+  },
   "rythmo_allowed": ["A", "U", "P"],
   "rythmo_schedule": {
     "P": ["MARDI"],

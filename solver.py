@@ -32,8 +32,13 @@ class Medecin(BaseModel):
     points_garde: int = 0
     points_nct: int = 0
     points_weekend: int = 0
-    points_coro: int = 0  # Équité CORO : scope MENSUEL (pas cumulé à vie comme les autres
-                           # catégories), pertinent uniquement pour M/O/W - voir plus bas.
+    points_coro: int = 0  # Équité CORO : scope 6 MOIS glissants, pertinent uniquement pour M/O/W.
+    # Équité Groupe 1 (échographistes B,Z,H,G,S) - scope 6 MOIS glissants,
+    # trois métriques SÉPARÉES (pas combinées) : même nombre de Cs, même
+    # nombre d'ETT, même nombre de Stress - confirmé utilisateur 28/07/2026.
+    points_cs: int = 0
+    points_ett: int = 0
+    points_stress: int = 0
     # Pondération d'équité : 100 = charge cible normale (plein temps, sans ajustement
     # d'ancienneté). Une valeur < 100 réduit la charge cible de ce médecin (ex: 50 pour
     # un mi-temps, 70 pour un médecin senior dont la charge est volontairement allégée).
@@ -285,21 +290,29 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     REEDUC_DAYS = set(rules["reeduc_days"])
     CORO_ALLOWED = set(rules["coro_allowed"])
     RYTHMO_ALLOWED = set(rules["rythmo_allowed"])
-    RYTHMO_SCHEDULE: Dict[str, set] = {doc: set(d) for doc, d in rules.get("rythmo_schedule", {}).items()}
-    # Créneaux (matin/am) par médecin, séparés du jour - permet à chacun d'avoir
-    # un créneau différent (P=matin+am, U/A=am seul). Défaut matin+am si absent
-    # du JSON, pour rester rétrocompatible avec d'anciennes configs.
-    RYTHMO_SLOTS: Dict[str, Tuple[str, ...]] = {
-        doc: tuple(slots) for doc, slots in rules.get("rythmo_slots", {}).items()
-    }
-    # Vendredi : alternance P/U selon la semaine (confirmé utilisateur 27/07/2026).
-    # Traité à PART du mécanisme générique RYTHMO_SCHEDULE/RYTHMO_SLOTS (qui suppose
-    # un créneau uniforme par médecin sur tous ses jours) car P a besoin de
-    # matin+am le mardi mais SEULEMENT matin le vendredi - un seul et même médecin,
-    # deux créneaux différents selon le jour. Voir section 6bis pour le forçage.
-    rythmo_vendredi_doctor = "P" if req.week_type == 1 else "U"
-    rythmo_vendredi_slot = "matin" if req.week_type == 1 else "am"
+    # Rythmo : calendrier confirmé (utilisateur + DOC022, 28/07/2026).
+    # Impaire : A Lun+Jeu am ; P Mar matin+am ; U Mer am + Ven am (fixe, pas d'alternance)
+    # Paire   : A Lun+Jeu am ; P Mar matin+am ; U Mer matin+am ;
+    #           Ven matin en alternance U/P selon la semaine
+    week_num = week_start.isocalendar()[1]
+    if req.week_type == 1:
+        RYTHMO_FORCE = [
+            ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
+            ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
+            ("U", "MERCREDI", "am"), ("U", "VENDREDI", "am"),
+        ]
+    else:
+        ven_doc = "U" if (week_num // 2) % 2 == 1 else "P"
+        RYTHMO_FORCE = [
+            ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
+            ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
+            ("U", "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
+            (ven_doc, "VENDREDI", "matin"),
+        ]
     NCT_ALLOWED = set(rules["nct_allowed"])
+    # ATL Matin/Midi/Soir = coronarographistes uniquement (M, O, W, FV, CH),
+    # confirmé via DOC022 (28/07/2026) - PAS un pool large de PERMANENT.
+    ASTREINTE_ALLOWED = set(rules.get("astreinte_allowed") or (list(CORO_ALLOWED) + ["CH"]))
     NCT_FIXED_SCHEDULE = rules["nct_fixed_schedule"]
     GARDE_ALLOWED = set(rules.get("garde_allowed", []))  # vide = pas de restriction (rétro-compatible)
 
@@ -333,14 +346,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
 
     def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
-        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
-            return True
-        return doc_id in RYTHMO_SCHEDULE and day_name in RYTHMO_SCHEDULE[doc_id]
+        return any(d == doc_id and day == day_name for d, day, _slot in RYTHMO_FORCE)
 
     def _rythmo_slots_for(doc_id: str, day_name: str) -> Tuple[str, ...]:
-        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
-            return (rythmo_vendredi_slot,)
-        return RYTHMO_SLOTS.get(doc_id, ("matin", "am"))
+        return tuple(slot for d, day, slot in RYTHMO_FORCE if d == doc_id and day == day_name)
 
     def add_var_if_allowed(doc_id: str, d_idx: int, slot: str, activity: str):
         day = days[d_idx]
@@ -358,7 +367,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
         if doc_id == fv_id:
             if not (d_idx == 0 and slot == "nuit" and activity == "GARDE") and \
-               not (d_idx == 3 and slot == "am" and activity == "CORO"):
+               not (d_idx == 3 and slot == "am" and activity == "CORO") and \
+               not (activity == "ASTREINTE" and doc_id in ASTREINTE_ALLOWED):
                 return
 
         day_name = DAY_NAMES_FR[d_idx]
@@ -398,6 +408,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if doc_id not in eligible_today:
                 return
         if activity == "CORO" and doc_id not in CORO_ALLOWED:
+            return
+        # ATL = coronarographistes uniquement (R/V/T/G... exclus). CH n'a pas
+        # de BoolVar ici (statut CH -> return plus bas), injecté séparément.
+        if activity == "ASTREINTE" and ASTREINTE_ALLOWED and doc_id not in ASTREINTE_ALLOWED:
             return
         if activity == "RYTHMO":
             if doc_id not in RYTHMO_ALLOWED:
@@ -717,7 +731,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
 
     for doc_id in medecins_map:
-        for d_idx in range(6):  # LUNDI(0) à SAMEDI(5)
+        for d_idx in range(5):  # LUNDI(0) à VENDREDI(4) - pas Ven->Sam, voir 10bis (couplage weekend dédié, 28/07/2026)
             night_vars = [
                 v for (doc, d, sl, act), v in x.items()
                 if doc == doc_id and d == d_idx and sl == "nuit" and act in ("GARDE", "ASTREINTE")
@@ -887,21 +901,21 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 f"RYTHMO {doc_id} non disponible {day_name} {slot} (vacances/congé ce jour-là ?)"
             )
 
-    for doc_id, rythmo_days in RYTHMO_SCHEDULE.items():
-        for day_name in rythmo_days:
-            for slot in RYTHMO_SLOTS.get(doc_id, ("matin", "am")):
-                _force_rythmo(doc_id, day_name, slot)
-
-    _force_rythmo(rythmo_vendredi_doctor, "VENDREDI", rythmo_vendredi_slot)
+    for doc_id, day_name, slot in RYTHMO_FORCE:
+        _force_rythmo(doc_id, day_name, slot)
 
     # --- 7. Règles d'exclusion métier ---
-    # 7.1 AM OFF après garde nuit (lendemain matin)
+    # 7.1 AM OFF après garde nuit (lendemain matin) - pas Ven->Sam
+    # (Sam Garde Matin = Ven Garde Nuit, couplage dédié en 10bis, 28/07/2026).
     for doc_id in medecins_map:
-        for d_idx in range(6):
+        for d_idx in range(5):  # LUNDI→VENDREDI seulement
             var_nuit_garde = x.get((doc_id, d_idx, "nuit", "GARDE"))
             if var_nuit_garde is None:
                 continue
-            am_next_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx + 1 and sl == "matin" and doc == doc_id]
+            am_next_vars = [
+                v for (doc, d, sl, act), v in x.items()
+                if d == d_idx + 1 and sl == "matin" and doc == doc_id and act != "GARDE"
+            ]
             if am_next_vars:
                 presence_matin = model.NewBoolVar(f"presence_matin_{doc_id}_{d_idx+1}")
                 model.Add(sum(am_next_vars) >= 1).OnlyEnforceIf(presence_matin)
@@ -1047,80 +1061,96 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     if var is not None:
                         model.Add(var == 0)
 
+    # Lun-Ven : ATL Matin/Midi = LA MÊME affectation que Coro matin/apm (pas
+    # juste le même pool éligible) - confirmé DOC022 (28/07/2026). Concerne
+    # M, O, W, FV (coronarographistes) ; CH n'a pas de var ici (structurel).
+    for d_idx in range(5):
+        for slot in ("matin", "am"):
+            for doc in CORO_ALLOWED:
+                v_astreinte = x.get((doc, d_idx, slot, "ASTREINTE"))
+                v_coro = x.get((doc, d_idx, slot, "CORO"))
+                if v_astreinte is not None and v_coro is not None:
+                    model.Add(v_astreinte == v_coro)
+
+    # --- 10bis. Couplages weekend (confirmé utilisateur 28/07/2026) ---
+    # ATL Sam/Dim : Matin = Midi = Nuit (un seul médecin par jour)
+    for d_idx in (5, 6):
+        for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
+            for doc in medecins_map:
+                va = x.get((doc, d_idx, slot_a, "ASTREINTE"))
+                vb = x.get((doc, d_idx, slot_b, "ASTREINTE"))
+                if va is not None and vb is not None:
+                    model.Add(va == vb)
+
+    # Garde Samedi : Midi = Nuit (un seul médecin)
+    for doc in medecins_map:
+        va = x.get((doc, 5, "am", "GARDE"))
+        vb = x.get((doc, 5, "nuit", "GARDE"))
+        if va is not None and vb is not None:
+            model.Add(va == vb)
+
+    # Garde Dimanche : Matin = Midi = Nuit (un seul médecin)
+    for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
+        for doc in medecins_map:
+            va = x.get((doc, 6, slot_a, "GARDE"))
+            vb = x.get((doc, 6, slot_b, "GARDE"))
+            if va is not None and vb is not None:
+                model.Add(va == vb)
+
+    # Garde Samedi Matin = celui qui a fait la garde de nuit vendredi
+    # (Sam Midi/Nuit reste un choix séparé, déjà couplé entre eux ci-dessus)
+    for doc in medecins_map:
+        ven_nuit = x.get((doc, 4, "nuit", "GARDE"))
+        sam_matin = x.get((doc, 5, "matin", "GARDE"))
+        if ven_nuit is not None and sam_matin is not None:
+            model.AddImplication(ven_nuit, sam_matin)
+
     # --- 11. Équité (objectif) ---
-    # Poids relatifs par type d'activité (harmonisés avec les compteurs historiques
-    # points_astreinte / points_garde / points_nct / points_weekend envoyés par le front).
-    # Configurable ici sans toucher au reste du solveur.
-    WEIGHT_ASTREINTE = 1
+    # Restructuré le 28/07/2026 (confirmé utilisateur) : plus un seul pool
+    # d'équité mélangeant tout, mais des groupes CLOISONNÉS pour éviter tout
+    # double comptage (leçon tirée du bug ATL=Coro qui faisait exploser
+    # l'équité générale). "Le principe d'équité ne doit pas créer de conflits."
+    #
+    # - Équité GARDE : les 11 médecins partageant la garde (A,S,B,H,G,P,M,O,W,U,Z)
+    # - Groupe 3 (coronarographistes M,O,W) : ASTREINTE (nuit+weekend
+    #   uniquement - le matin/midi semaine est déjà capté par CORO, voir
+    #   couplage section 10) + CORO, comme deux métriques d'équité séparées.
+    # - Groupe 1 (échographistes) et Groupe 2 (rythmologues) : voir note plus
+    #   bas - pas encore de levier solveur actif pour eux à ce stade.
+
     WEIGHT_GARDE = 1
-    WEIGHT_NCT = 2       # nuit du jeudi, plus contraignante
-    WEIGHT_WEEKEND = 2   # astreinte de weekend, plus contraignante
+    GARDE_EQUITY_IDS = {"A", "S", "B", "H", "G", "P", "M", "O", "W", "U", "Z"} & set(medecins_map)
 
-    def activity_weight(activity: str, d_idx: int) -> int:
-        if activity == "NCT":
-            return WEIGHT_NCT
-        if activity == "ASTREINTE" and d_idx in (5, 6):
-            return WEIGHT_WEEKEND
-        if activity == "ASTREINTE":
-            return WEIGHT_ASTREINTE
-        if activity == "GARDE":
-            return WEIGHT_GARDE
-        return 0  # CORO / REEDUC / RYTHMO / PRE_OP : hors périmètre équité garde/astreinte
-
-    # Médecins concernés par l'équité garde/astreinte : tous les statuts qui peuvent
-    # réellement être affectés à ASTREINTE/GARDE/NCT (PERMANENT + ASTREINTE_CORO).
-    # Exclus : CH (structure fixe), FV/DAAS/D (créneaux externes fixes), ADMIN.
-    equity_doctor_ids = {
-        m.id for m in req.medecins
-        if m.statut in (StatutMedecin.PERMANENT, StatutMedecin.ASTREINTE_CORO)
-    }
-
-    total_points: Dict[str, Any] = {}
-    for doc in equity_doctor_ids:
+    garde_points: Dict[str, Any] = {}
+    for doc in GARDE_EQUITY_IDS:
         m = medecins_map[doc]
         pct = m.poids_equite_pct if m.poids_equite_pct > 0 else 100
-        # Facteur de normalisation : un médecin à pct=50 (mi-temps, ou charge cible
-        # réduite pour ancienneté) voit chacun de ses points compter double dans le
-        # calcul d'équité normalisé -> le solveur cherchera naturellement à lui donner
-        # moins de gardes/astreintes en valeur brute pour atteindre le même niveau
-        # "normalisé" que ses collègues à pct=100.
         norm = lambda w: round(w * 100 / pct)  # noqa: E731
-
-        historical = (
-            m.points_astreinte * norm(WEIGHT_ASTREINTE)
-            + m.points_garde * norm(WEIGHT_GARDE)
-            + m.points_nct * norm(WEIGHT_NCT)
-            + m.points_weekend * norm(WEIGHT_WEEKEND)
-        )
+        historical = m.points_garde * norm(WEIGHT_GARDE)
         this_week_terms = [
-            norm(activity_weight(activity, d_idx)) * var
+            norm(WEIGHT_GARDE) * var
             for (doc_id_x, d_idx, slot, activity), var in x.items()
-            if doc_id_x == doc and activity_weight(activity, d_idx) > 0
+            if doc_id_x == doc and activity == "GARDE"
         ]
-        # IntVar bornée large pour couvrir historique + charge de la semaine
-        # (le facteur de normalisation peut monter la borne pour les petites quotités).
-        upper_bound = historical + 7 * norm(WEIGHT_NCT + WEIGHT_WEEKEND + WEIGHT_GARDE) + 10
-        total_var = model.NewIntVar(0, max(upper_bound, 1), f"total_points_{doc}")
+        upper_bound = historical + 7 * norm(WEIGHT_GARDE) + 10
+        total_var = model.NewIntVar(0, max(upper_bound, 1), f"garde_points_{doc}")
         model.Add(total_var == historical + sum(this_week_terms))
-        total_points[doc] = total_var
+        garde_points[doc] = total_var
 
-    if total_points:
+    if garde_points:
         max_points = model.NewIntVar(0, 100000, "max_points")
         min_points = model.NewIntVar(0, 100000, "min_points")
-        for doc, var in total_points.items():
+        for doc, var in garde_points.items():
             model.Add(max_points >= var)
             model.Add(min_points <= var)
     else:
-        warnings.append("Équité : aucun médecin éligible trouvé pour l'objectif d'équité")
+        warnings.append("Équité garde : aucun médecin éligible trouvé")
         max_points = model.NewConstant(0)
         min_points = model.NewConstant(0)
 
-    # --- Équité CORO (M, O, W uniquement - seuls coronarographistes internes,
-    #     FV en fait aussi mais est externe et hors périmètre d'équité) ---
-    # Scope MENSUEL et non cumulé à vie : `m.points_coro` est déjà calculé côté
-    # front pour ne représenter QUE le mois calendaire en cours (voir
-    # getMonthlyCoroEquity() dans app/actions/guard-api-actions.ts), contrairement
-    # à points_astreinte/garde/nct/weekend qui sont cumulés depuis toujours.
+    # --- Équité CORO (Groupe 3 : M, O, W uniquement - FV/CH non concernés) ---
+    # Scope 6 MOIS glissants (pas cumulé à vie, pas mensuel) : m.points_coro
+    # doit refléter cette fenêtre côté front.
     WEIGHT_CORO = 1
     coro_points: Dict[str, Any] = {}
     for doc in astreinte_coro_ids:
@@ -1136,12 +1166,62 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         model.Add(coro_var == historical_coro + sum(this_week_coro))
         coro_points[doc] = coro_var
 
+    # --- Équité ASTREINTE ATL (Groupe 3 : M, O, W) - nuit + weekend
+    # uniquement, le matin/midi semaine étant déjà capté par CORO ci-dessus
+    # (ATL=Coro, même affectation - éviter le double comptage).
+    WEIGHT_ASTREINTE_G3 = 1
+    astreinte_g3_points: Dict[str, Any] = {}
+    for doc in astreinte_coro_ids:
+        m = medecins_map[doc]
+        historical_astreinte = m.points_astreinte * WEIGHT_ASTREINTE_G3
+        this_week_astreinte = [
+            WEIGHT_ASTREINTE_G3 * var
+            for (doc_id_x, d_idx, slot, activity), var in x.items()
+            if doc_id_x == doc and activity == "ASTREINTE" and (d_idx in (5, 6) or slot == "nuit")
+        ]
+        upper_bound = historical_astreinte + 7 * WEIGHT_ASTREINTE_G3 + 5
+        a_var = model.NewIntVar(0, max(upper_bound, 1), f"astreinte_g3_points_{doc}")
+        model.Add(a_var == historical_astreinte + sum(this_week_astreinte))
+        astreinte_g3_points[doc] = a_var
+
+    # --- Équité Groupe 1 (échographistes B,Z,H,G,S) : Cs / ETT / Stress,
+    # trois métriques séparées, scope 6 mois glissants (confirmé utilisateur
+    # 28/07/2026 - revient sur la décision précédente de les laisser
+    # purement informatives). Réutilise les variables déjà créées dans
+    # historical_vars (section 2bis), pas de nouvelles variables.
+    GROUPE1_IDS = {"B", "Z", "H", "G", "S"} & set(medecins_map)
+    CS_ROW_KEYS = {"Matin - Cs PSS", "Matin - Cs Tessée", "Apm - Cs PSS", "Apm - Cs Tessée"}
+    ETT_ROW_KEYS = {"Matin - ETT salle 1", "Matin - ETT salle 2", "Apm - ETT salle 1", "Apm - ETT salle 2"}
+    STRESS_ROW_KEYS = {"Matin - Stress", "Apm - Stress"}
+
+    def _groupe1_points(row_keys: Set[str], historical_getter, label: str) -> Dict[str, Any]:
+        points: Dict[str, Any] = {}
+        for doc in GROUPE1_IDS:
+            m = medecins_map[doc]
+            historical = historical_getter(m)
+            this_week_terms = [
+                var
+                for (row_key, d_idx), day_vars in historical_vars.items()
+                if row_key in row_keys
+                for doc_id_x, (var, _freq) in day_vars.items()
+                if doc_id_x == doc
+            ]
+            upper_bound = historical + 7 + 5
+            var_total = model.NewIntVar(0, max(upper_bound, 1), f"g1_{label}_{doc}")
+            model.Add(var_total == historical + sum(this_week_terms))
+            points[doc] = var_total
+        return points
+
+    cs_points = _groupe1_points(CS_ROW_KEYS, lambda m: m.points_cs, "cs")
+    ett_points = _groupe1_points(ETT_ROW_KEYS, lambda m: m.points_ett, "ett")
+    stress_points = _groupe1_points(STRESS_ROW_KEYS, lambda m: m.points_stress, "stress")
+
     # --- Bonus de fidélité historique (Cs/ETT/EE/hors site) ---
     # Récompense (dans l'objectif, donc soustrait puisqu'on minimise) le fait
     # d'assigner le médecin historiquement le plus fréquent sur ce créneau.
-    # Poids volontairement modeste : ne doit pas dominer l'équité garde/astreinte
+    # Poids volontairement modeste : ne doit pas dominer l'équité garde
     # (l'enjeu principal), juste départager entre plusieurs solutions
-    # équivalentes côté équité en faveur de ce qui ressemble le plus au passé.
+    # équivalentes en faveur de ce qui ressemble le plus au passé.
     WEIGHT_HISTORICAL_FIDELITY = 1
     historical_bonus_terms = [
         WEIGHT_HISTORICAL_FIDELITY * freq * var
@@ -1153,24 +1233,35 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     hors_site_bonus = sum(hors_site_priority_bonus) if hors_site_priority_bonus else 0
     entrees_pss_bonus = sum(entrees_pss_fill_bonus) if entrees_pss_fill_bonus else 0
 
-    if coro_points:
-        coro_max = model.NewIntVar(0, 100000, "coro_max")
-        coro_min = model.NewIntVar(0, 100000, "coro_min")
-        for doc, var in coro_points.items():
-            model.Add(coro_max >= var)
-            model.Add(coro_min <= var)
-        # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
-        # garde/astreinte (poids fort, c'est l'enjeu principal), l'équité CORO
-        # mensuelle (poids plus léger, sur un périmètre de 3 personnes seulement),
-        # le bonus de fidélité historique (Cs/ETT/EE), la priorité hors site
-        # (ex: CDL, H > O) et la préférence de remplissage Entrées PSS en une
-        # seule expression additive.
-        model.Minimize(
-            (max_points - min_points) + (coro_max - coro_min)
-            - historical_bonus - hors_site_bonus - entrees_pss_bonus
-        )
-    else:
-        model.Minimize((max_points - min_points) - historical_bonus - hors_site_bonus - entrees_pss_bonus)
+    def _spread(points: Dict[str, Any], name: str):
+        if not points:
+            return 0
+        pmax = model.NewIntVar(0, 100000, f"{name}_max")
+        pmin = model.NewIntVar(0, 100000, f"{name}_min")
+        for var in points.values():
+            model.Add(pmax >= var)
+            model.Add(pmin <= var)
+        return pmax - pmin
+
+    coro_spread = _spread(coro_points, "coro")
+    astreinte_g3_spread = _spread(astreinte_g3_points, "astreinte_g3")
+    cs_spread = _spread(cs_points, "cs")
+    ett_spread = _spread(ett_points, "ett")
+    stress_spread = _spread(stress_points, "stress")
+
+    # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
+    # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
+    # ASTREINTE du groupe 3 (poids plus léger, 3 personnes chacune), l'équité
+    # Cs/ETT/Stress du groupe 1 (poids léger également, 5 personnes), le
+    # bonus de fidélité historique (Cs/ETT/EE), la priorité hors site (ex:
+    # CDL, V > O) et la préférence de remplissage Entrées PSS - en une seule
+    # expression additive, chaque terme portant sur des activités disjointes
+    # (pas de double comptage entre eux).
+    model.Minimize(
+        (max_points - min_points) + coro_spread + astreinte_g3_spread
+        + cs_spread + ett_spread + stress_spread
+        - historical_bonus - hors_site_bonus - entrees_pss_bonus
+    )
 
 
     # --- 12. Résolution ---

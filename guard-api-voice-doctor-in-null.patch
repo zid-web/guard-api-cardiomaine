@@ -1,0 +1,145 @@
+diff --git a/voice_command.py b/voice_command.py
+index b5eaeb2..58715a8 100644
+--- a/voice_command.py
++++ b/voice_command.py
+@@ -18,7 +18,7 @@ from datetime import date, timedelta
+ from typing import List, Optional
+ 
+ from fastapi import HTTPException
+-from pydantic import BaseModel
++from pydantic import BaseModel, ValidationError
+ import anthropic
+ 
+ from llm_json import parse_llm_json
+@@ -51,8 +51,9 @@ class ParsedCommand(BaseModel):
+     slot: str                      # "matin" | "am" | "nuit"
+     activity: str                  # "ASTREINTE" | "GARDE" | "CORO" | "NCT"
+     doctor_out: Optional[str] = None   # médecin remplacé (None si simple ajout)
+-    doctor_in: str                 # médecin qui prend le créneau
+-    confidence: str                # "high" | "low" - si "low", le frontend doit demander confirmation
++    # Optional à la validation brute : Claude renvoie parfois null ; normalisé ensuite.
++    doctor_in: Optional[str] = None
++    confidence: str = "low"        # "high" | "low" - si "low", le frontend doit demander confirmation
+ 
+ 
+ class VoiceCommandResponse(BaseModel):
+@@ -95,6 +96,10 @@ si tu as dû deviner.
+ NCT tombe en pratique le jeudi.
+ - Si la consigne ne mentionne pas de remplacement explicite (ex: "S est de garde demain" sans mention \
+ d'un autre médecin), mets "doctor_out": null.
++- "doctor_in" est OBLIGATOIRE et doit toujours être une chaîne (code médecin). Ne renvoie JAMAIS null \
++ni omis pour "doctor_in". Pour un retrait sans remplaçant, mets doctor_in au médecin concerné avec \
++activity VACANCES/CONGE, ou reformule — jamais doctor_in=null.
++- Si tu hésites entre deux codes, choisis le plus probable et mets "confidence": "low".
+ - Si le texte liste PLUSIEURS dates NCT (ex: "2026-09-10 → M"), réponds avec un objet :
+   { "commands": [ {…}, {…} ] } où chaque élément suit le format ci-dessus (activity NCT, slot nuit).
+ - Sinon réponds avec un seul objet (pas de clé "commands").
+@@ -102,6 +107,75 @@ d'un autre médecin), mets "doctor_out": null.
+ """
+ 
+ 
++
++def _norm_doctor_code(value) -> Optional[str]:
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        value = str(value)
++    value = value.strip()
++    if not value or value.lower() in ("null", "none", "nil"):
++        return None
++    return value
++
++
++def normalize_raw_command(item: dict, known_doctors: Optional[List[str]] = None) -> dict:
++    """Corrige les JSON Claude invalides avant validation Pydantic.
++
++    Cas fréquent : doctor_in=null alors que le médecin est dans doctor_out,
++    ou doctor_in omis pour une absence / affectation simple.
++    """
++    if not isinstance(item, dict):
++        raise TypeError(f"Commande attendue comme objet JSON, reçu: {type(item).__name__}")
++    out = dict(item)
++    din = _norm_doctor_code(out.get("doctor_in"))
++    dout = _norm_doctor_code(out.get("doctor_out"))
++
++    if din is None and dout is not None:
++        # Claude a souvent inversé / mis le seul médecin dans doctor_out
++        din = dout
++        dout = None
++
++    # Alignement case / codes connus (Val vs VAL, etc.)
++    known = known_doctors or []
++    known_map = {k.upper(): k for k in known}
++
++    def match_known(code: Optional[str]) -> Optional[str]:
++        if code is None:
++            return None
++        if code in known:
++            return code
++        return known_map.get(code.upper(), code)
++
++    out["doctor_in"] = match_known(din)
++    out["doctor_out"] = match_known(dout)
++    if not out.get("confidence"):
++        out["confidence"] = "low"
++    return out
++
++
++def _parse_command_items(data, known_doctors: List[str]) -> List[ParsedCommand]:
++    if isinstance(data, dict) and isinstance(data.get("commands"), list):
++        raw_items = data["commands"]
++    elif isinstance(data, list):
++        raw_items = data
++    else:
++        raw_items = [data]
++    cmds: List[ParsedCommand] = []
++    for item in raw_items:
++        normalized = normalize_raw_command(item, known_doctors)
++        cmds.append(ParsedCommand(**normalized))
++    if not cmds:
++        raise ValueError("Aucune commande dans la réponse LLM")
++    missing = [i for i, c in enumerate(cmds) if not c.doctor_in]
++    if missing:
++        raise ValueError(
++            "Médecin destinataire (doctor_in) manquant après interprétation. "
++            "Reformulez en précisant le code médecin (ex. « S est de garde mardi »)."
++        )
++    return cmds
++
++
+ def parse_commands_with_claude(text: str, reference_date: str, known_doctors: List[str]) -> List[ParsedCommand]:
+     user_prompt = f"""Date de référence (aujourd'hui) : {reference_date}
+ Médecins connus (codes valides) : {", ".join(known_doctors)}
+@@ -118,10 +192,7 @@ Consigne à interpréter : "{text}"
+         )
+         raw_text = response.content[0].text.strip()
+         data = parse_llm_json(raw_text)
+-        if isinstance(data, dict) and isinstance(data.get("commands"), list):
+-            cmds = [ParsedCommand(**item) for item in data["commands"]]
+-        else:
+-            cmds = [ParsedCommand(**data)]
++        cmds = _parse_command_items(data, known_doctors)
+         # Normalise NCT → slot nuit
+         normalized: List[ParsedCommand] = []
+         for cmd in cmds:
+@@ -129,7 +200,7 @@ Consigne à interpréter : "{text}"
+                 cmd = cmd.model_copy(update={"slot": "nuit"})
+             normalized.append(cmd)
+         return normalized
+-    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
++    except (json.JSONDecodeError, KeyError, ValueError, TypeError, ValidationError) as e:
+         raise HTTPException(
+             status_code=422,
+             detail=f"Impossible d'interpréter la consigne vocale : {str(e)}"
+@@ -232,6 +303,11 @@ def handle_voice_command(req: VoiceCommandRequest) -> VoiceCommandResponse:
+         raise HTTPException(status_code=422, detail="Aucune consigne interprétable")
+ 
+     for parsed in commands:
++        if not parsed.doctor_in:
++            raise HTTPException(
++                status_code=422,
++                detail="Médecin destinataire (doctor_in) manquant. Reformulez en précisant le code médecin.",
++            )
+         if parsed.doctor_in not in req.known_doctors:
+             raise HTTPException(
+                 status_code=422,

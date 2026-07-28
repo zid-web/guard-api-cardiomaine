@@ -1,0 +1,141 @@
+diff --git a/solver.py b/solver.py
+--- a/solver.py
++++ b/solver.py
+     # un créneau uniforme par médecin sur tous ses jours) car P a besoin de
+     # matin+am le mardi mais SEULEMENT matin le vendredi - un seul et même médecin,
+     # deux créneaux différents selon le jour. Voir section 6bis pour le forçage.
+-    rythmo_vendredi_doctor = "P" if req.week_type == 1 else "U"
+-    rythmo_vendredi_slot = "matin" if req.week_type == 1 else "am"
++    # Rythmo : calendrier confirmé utilisateur 28/07/2026
++    # Impaire : A Lun+Jeu am ; P Mar matin+am ; U Mer am + Ven am
++    # Paire : A Lun+Jeu am ; P Mar matin+am ; U Mer matin+am ;
++    #         Ven matin alternance U/P (week_num//2 impair → U, pair → P)
++    week_num = week_start.isocalendar()[1]
++    if req.week_type == 1:
++        RYTHMO_FORCE = [
++            ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
++            ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
++            ("U", "MERCREDI", "am"), ("U", "VENDREDI", "am"),
++        ]
++    else:
++        ven_doc = "U" if (week_num // 2) % 2 == 1 else "P"
++        RYTHMO_FORCE = [
++            ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
++            ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
++            ("U", "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
++            (ven_doc, "VENDREDI", "matin"),
++        ]
+     NCT_ALLOWED = set(rules["nct_allowed"])
+     NCT_FIXED_SCHEDULE = rules["nct_fixed_schedule"]
+     GARDE_ALLOWED = set(rules.get("garde_allowed", []))  # vide = pas de restriction (rétro-compatible)
+@@ -333,14 +350,10 @@
+     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
+ 
+     def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
+-        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
+-            return True
+-        return doc_id in RYTHMO_SCHEDULE and day_name in RYTHMO_SCHEDULE[doc_id]
++        return any(d == doc_id and day == day_name for d, day, _slot in RYTHMO_FORCE)
+ 
+     def _rythmo_slots_for(doc_id: str, day_name: str) -> Tuple[str, ...]:
+-        if day_name == "VENDREDI" and doc_id == rythmo_vendredi_doctor:
+-            return (rythmo_vendredi_slot,)
+-        return RYTHMO_SLOTS.get(doc_id, ("matin", "am"))
++        return tuple(slot for d, day, slot in RYTHMO_FORCE if d == doc_id and day == day_name)
+ 
+     def add_var_if_allowed(doc_id: str, d_idx: int, slot: str, activity: str):
+         day = days[d_idx]
+@@ -717,7 +730,7 @@
+     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
+ 
+     for doc_id in medecins_map:
+-        for d_idx in range(6):  # LUNDI(0) à SAMEDI(5)
++        for d_idx in range(5):  # LUNDI→JEUDI ; pas Ven→Sam (Sam Matin = Ven Nuit)
+             night_vars = [
+                 v for (doc, d, sl, act), v in x.items()
+                 if doc == doc_id and d == d_idx and sl == "nuit" and act in ("GARDE", "ASTREINTE")
+@@ -871,12 +884,7 @@
+             else:
+                 warnings.append(f"FV : créneau {DAY_NAMES_FR[d_idx]} {slot} {act} non disponible")
+ 
+-    # --- 6bis. RYTHMO forcé sur le(s) créneau(x) exact(s) par jour/médecin ---
+-    # A = après-midi seulement (lundi, jeudi) ; P = matin+après-midi (mardi) ;
+-    # U = matin+après-midi (mercredi) ; vendredi = alternance P/U selon
+-    # week_type, un seul créneau (voir rythmo_schedule/rythmo_slots dans
+-    # rules_config.json + rythmo_vendredi_doctor/slot ci-dessus). Confirmé
+-    # précisément avec l'utilisateur le 27/07/2026.
++    # --- 6bis. RYTHMO forcé (calendrier impair/pair — voir RYTHMO_FORCE) ---
+     def _force_rythmo(doc_id: str, day_name: str, slot: str):
+         d_idx = DAY_NAMES_FR.index(day_name)
+         var = x.get((doc_id, d_idx, slot, "RYTHMO"))
+@@ -887,21 +895,21 @@
+                 f"RYTHMO {doc_id} non disponible {day_name} {slot} (vacances/congé ce jour-là ?)"
+             )
+ 
+-    for doc_id, rythmo_days in RYTHMO_SCHEDULE.items():
+-        for day_name in rythmo_days:
+-            for slot in RYTHMO_SLOTS.get(doc_id, ("matin", "am")):
+-                _force_rythmo(doc_id, day_name, slot)
+-
+-    _force_rythmo(rythmo_vendredi_doctor, "VENDREDI", rythmo_vendredi_slot)
++    for doc_id, day_name, slot in RYTHMO_FORCE:
++        _force_rythmo(doc_id, day_name, slot)
+ 
+     # --- 7. Règles d'exclusion métier ---
+-    # 7.1 AM OFF après garde nuit (lendemain matin)
++    # 7.1 AM OFF après garde nuit (lendemain matin) — pas Ven→Sam
++    # (Sam Garde Matin = Ven Garde Nuit, confirmé 28/07/2026).
+     for doc_id in medecins_map:
+-        for d_idx in range(6):
++        for d_idx in range(5):  # Lun→Ven seulement (pas Ven→Sam, pas Sam→Dim)
+             var_nuit_garde = x.get((doc_id, d_idx, "nuit", "GARDE"))
+             if var_nuit_garde is None:
+                 continue
+-            am_next_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx + 1 and sl == "matin" and doc == doc_id]
++            am_next_vars = [
++                v for (doc, d, sl, act), v in x.items()
++                if d == d_idx + 1 and sl == "matin" and doc == doc_id and act != "GARDE"
++            ]
+             if am_next_vars:
+                 presence_matin = model.NewBoolVar(f"presence_matin_{doc_id}_{d_idx+1}")
+                 model.Add(sum(am_next_vars) >= 1).OnlyEnforceIf(presence_matin)
+@@ -1047,6 +1055,39 @@
+                     if var is not None:
+                         model.Add(var == 0)
+ 
++
++    # --- 10bis. Couplages weekend (confirmé utilisateur 28/07/2026) ---
++    # ATL Sam/Dim : Matin = Midi = Nuit (un seul médecin / jour)
++    for d_idx in (5, 6):
++        for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
++            for doc in medecins_map:
++                va = x.get((doc, d_idx, slot_a, "ASTREINTE"))
++                vb = x.get((doc, d_idx, slot_b, "ASTREINTE"))
++                if va is not None and vb is not None:
++                    model.Add(va == vb)
++
++    # Garde Sam : Midi = Nuit (un médecin)
++    for doc in medecins_map:
++        va = x.get((doc, 5, "am", "GARDE"))
++        vb = x.get((doc, 5, "nuit", "GARDE"))
++        if va is not None and vb is not None:
++            model.Add(va == vb)
++
++    # Garde Dim : Matin = Midi = Nuit (un médecin)
++    for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
++        for doc in medecins_map:
++            va = x.get((doc, 6, slot_a, "GARDE"))
++            vb = x.get((doc, 6, slot_b, "GARDE"))
++            if va is not None and vb is not None:
++                model.Add(va == vb)
++
++    # Garde Sam Matin ⊇ Ven Garde Nuit (association Sam Midi/Nuit ajoutée côté front)
++    for doc in medecins_map:
++        ven_nuit = x.get((doc, 4, "nuit", "GARDE"))
++        sam_matin = x.get((doc, 5, "matin", "GARDE"))
++        if ven_nuit is not None and sam_matin is not None:
++            model.AddImplication(ven_nuit, sam_matin)
++
+     # --- 11. Équité (objectif) ---
+     # Poids relatifs par type d'activité (harmonisés avec les compteurs historiques
+     # points_astreinte / points_garde / points_nct / points_weekend envoyés par le front).

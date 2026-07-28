@@ -1,0 +1,53 @@
+diff --git a/rules_config.json b/rules_config.json
+@@ -6,6 +6,7 @@
+   },
+   "reeduc_days": ["LUNDI", "MERCREDI", "VENDREDI"],
+   "coro_allowed": ["W", "M", "O", "FV"],
++  "astreinte_allowed": ["M", "O", "W", "FV", "CH"],
+   "rythmo_allowed": ["A", "U", "P"],
+   "rythmo_schedule": {
+     "P": ["MARDI"],
+diff --git a/config.py b/config.py
+@@ -46,8 +46,9 @@
+         return default
+     merged = dict(default)
+     for key, value in override.items():
+-        if key in merged:
+-            merged[key] = value
++        # Accepter aussi les nouvelles clés (ex. astreinte_allowed) pour que
++        # rules_override front prenne effet même avant merge du JSON embarqué.
++        merged[key] = value
+     return merged
+ 
+ 
+diff --git a/solver.py b/solver.py
+@@ -300,6 +300,8 @@
+     rythmo_vendredi_doctor = "P" if req.week_type == 1 else "U"
+     rythmo_vendredi_slot = "matin" if req.week_type == 1 else "am"
+     NCT_ALLOWED = set(rules["nct_allowed"])
++    # ATL Matin/Midi/Soir = coronarographistes uniquement (M, O, W, FV, CH).
++    ASTREINTE_ALLOWED = set(rules.get("astreinte_allowed") or (list(CORO_ALLOWED) + ["CH"]))
+     NCT_FIXED_SCHEDULE = rules["nct_fixed_schedule"]
+     GARDE_ALLOWED = set(rules.get("garde_allowed", []))  # vide = pas de restriction (rétro-compatible)
+ 
+@@ -358,7 +360,8 @@
+ 
+         if doc_id == fv_id:
+             if not (d_idx == 0 and slot == "nuit" and activity == "GARDE") and \
+-               not (d_idx == 3 and slot == "am" and activity == "CORO"):
++               not (d_idx == 3 and slot == "am" and activity == "CORO") and \
++               not (activity == "ASTREINTE" and doc_id in ASTREINTE_ALLOWED):
+                 return
+ 
+         day_name = DAY_NAMES_FR[d_idx]
+@@ -399,6 +402,10 @@
+                 return
+         if activity == "CORO" and doc_id not in CORO_ALLOWED:
+             return
++        # ATL = coronarographistes uniquement (R/V/T/G… exclus).
++        # CH n'a pas de BoolVar (statut CH return) : injecté en post-traitement.
++        if activity == "ASTREINTE" and ASTREINTE_ALLOWED and doc_id not in ASTREINTE_ALLOWED:
++            return
+         if activity == "RYTHMO":
+             if doc_id not in RYTHMO_ALLOWED:
+                 return

@@ -1,6 +1,9 @@
 {
   "wom_pool": ["W", "O", "M"],
   "reeduc_allowed": ["Z", "B", "S", "G", "H"],
+  "reeduc_allowed_extra_by_day": {
+    "MERCREDI": ["R", "K"]
+  },
   "reeduc_days": ["LUNDI", "MERCREDI", "VENDREDI"],
   "coro_allowed": ["W", "M", "O", "FV"],
   "rythmo_allowed": ["A", "U", "P"],

@@ -285,11 +285,12 @@ HORS_SITE_CONFIG = {
     "Hors site - IRM":    {"allowed": ["S"], "full_day": False,
                             "fixed_slots_by_doctor": {"S": [("LUNDI", "matin"), ("VENDREDI", "am")]},
                             "non_exclusive": True},
-    # Scinti : créneaux fixes par médecin (confirmé utilisateur 28/07/2026) -
-    # R mardi matin uniquement, T lundi+mercredi matin uniquement. Remplace
-    # l'ancien modèle "n'importe quel jour, optionnel".
+    # Scinti : roulement R (mardi matin) / T (lundi+mercredi matin) reste une
+    # PROPOSITION optionnelle, pas une contrainte fixe (confirmé utilisateur
+    # 29/07/2026 - assoupli pour donner plus de marge au solveur, évite les
+    # "créneau fixe non couvert" quand R/T indisponibles).
     "Hors site - Scinti": {"allowed": ["R", "T"], "full_day": False,
-                            "fixed_slots_by_doctor": {
+                            "preferred_slots_by_doctor": {
                                 "R": [("MARDI", "matin")],
                                 "T": [("LUNDI", "matin"), ("MERCREDI", "matin")],
                             }},
@@ -544,6 +545,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         full_day = config["full_day"]
         priority = config.get("priority", [])
         fixed_slots_by_doctor = config.get("fixed_slots_by_doctor")
+        preferred_slots_by_doctor = config.get("preferred_slots_by_doctor")
         activity_name = f"HORSSITE::{row_key}"
 
         if fixed_slots_by_doctor:
@@ -600,6 +602,35 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         irm_non_exclusive_pending.append((doc_id, d_idx, slot, var))
             continue
 
+        if preferred_slots_by_doctor:
+            # Comme fixed_slots_by_doctor, mais OPTIONNEL (pas de model.Add
+            # (var == 1)) : une préférence forte via bonus, pas une
+            # obligation. Donne au solveur la liberté de laisser le créneau
+            # non couvert si le(s) médecin(s) concerné(s) sont indisponibles,
+            # plutôt qu'un avertissement "créneau fixe non couvert" (confirmé
+            # utilisateur 29/07/2026).
+            slot_candidates: Dict[tuple, List[str]] = {}
+            for doc_id, slots in preferred_slots_by_doctor.items():
+                for day_name, slot in slots:
+                    slot_candidates.setdefault((day_name, slot), []).append(doc_id)
+
+            for (day_name, slot), candidates in slot_candidates.items():
+                d_idx = DAY_NAMES_FR.index(day_name)
+                day_vars: Dict[str, Any] = {}
+                for doc_id in candidates:
+                    if doc_id not in medecins_map:
+                        continue
+                    if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
+                        continue
+                    var = model.NewBoolVar(f"pref_{doc_id}_{d_idx}_{row_key}")
+                    x[(doc_id, d_idx, slot, activity_name)] = var
+                    day_vars[doc_id] = var
+                    hors_site_priority_bonus.append(10 * var)  # préférence forte, pas absolue
+                if day_vars:
+                    model.Add(sum(day_vars.values()) <= 1)
+                    hors_site_vars[(row_key, d_idx)] = day_vars
+            continue
+
         for d_idx in range(7):
             day_vars: Dict[str, Any] = {}
             for doc_id in allowed:
@@ -636,27 +667,56 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # l'après-midi, cf. full_day_hors_site_vars).
     if req.lfb_doctor:
         jeudi_idx = DAY_NAMES_FR.index("JEUDI")
-        if req.lfb_doctor not in ("H", "S", "G"):
+        LFB_POOL = ["H", "S", "G"]
+        if req.lfb_doctor not in LFB_POOL:
             warnings.append(f"lfb_doctor '{req.lfb_doctor}' invalide (attendu H, S ou G) - ignoré.")
-        elif is_on_vacation(req.lfb_doctor, days[jeudi_idx], req.vacations) or is_on_vacation(req.lfb_doctor, days[jeudi_idx], req.congres):
-            warnings.append(f"LFB : {req.lfb_doctor} en congé ce jeudi - créneau non couvert cette semaine.")
-        elif req.lfb_doctor in medecins_map:
-            var = model.NewBoolVar(f"lfb_{req.lfb_doctor}_{jeudi_idx}")
-            x[(req.lfb_doctor, jeudi_idx, "matin", "HORSSITE::Hors site - LFB")] = var
-            model.Add(var == 1)
-            full_day_hors_site_vars.append((req.lfb_doctor, jeudi_idx, var))
+        else:
+            # Repli automatique sur les 2 autres du pool si le désigné est
+            # indisponible (confirmé utilisateur 29/07/2026, donne plus de
+            # marge au solveur plutôt que de laisser le créneau non couvert).
+            candidates = [req.lfb_doctor] + [d for d in LFB_POOL if d != req.lfb_doctor]
+            winner = None
+            for doc in candidates:
+                if doc not in medecins_map:
+                    continue
+                if is_on_vacation(doc, days[jeudi_idx], req.vacations) or is_on_vacation(doc, days[jeudi_idx], req.congres):
+                    continue
+                winner = doc
+                break
+            if winner is None:
+                warnings.append(f"LFB : aucun de H/S/G disponible ce jeudi - créneau non couvert cette semaine.")
+            else:
+                var = model.NewBoolVar(f"lfb_{winner}_{jeudi_idx}")
+                x[(winner, jeudi_idx, "matin", "HORSSITE::Hors site - LFB")] = var
+                model.Add(var == 1)
+                full_day_hors_site_vars.append((winner, jeudi_idx, var))
+                if winner != req.lfb_doctor:
+                    warnings.append(f"LFB : {req.lfb_doctor} indisponible ce jeudi, repli sur {winner}.")
 
     if req.pssl_doctor:
         jeudi_idx = DAY_NAMES_FR.index("JEUDI")
-        if req.pssl_doctor not in ("B", "Z"):
+        PSSL_POOL = ["B", "Z"]
+        if req.pssl_doctor not in PSSL_POOL:
             warnings.append(f"pssl_doctor '{req.pssl_doctor}' invalide (attendu B ou Z) - ignoré.")
-        elif is_on_vacation(req.pssl_doctor, days[jeudi_idx], req.vacations) or is_on_vacation(req.pssl_doctor, days[jeudi_idx], req.congres):
-            warnings.append(f"PSSL : {req.pssl_doctor} en congé ce jeudi - créneau non couvert cette semaine.")
-        elif req.pssl_doctor in medecins_map:
-            var = model.NewBoolVar(f"pssl_{req.pssl_doctor}_{jeudi_idx}")
-            x[(req.pssl_doctor, jeudi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
-            model.Add(var == 1)
-            full_day_hors_site_vars.append((req.pssl_doctor, jeudi_idx, var))
+        else:
+            candidates = [req.pssl_doctor] + [d for d in PSSL_POOL if d != req.pssl_doctor]
+            winner = None
+            for doc in candidates:
+                if doc not in medecins_map:
+                    continue
+                if is_on_vacation(doc, days[jeudi_idx], req.vacations) or is_on_vacation(doc, days[jeudi_idx], req.congres):
+                    continue
+                winner = doc
+                break
+            if winner is None:
+                warnings.append("PSSL : ni B ni Z disponible ce jeudi - créneau non couvert cette semaine.")
+            else:
+                var = model.NewBoolVar(f"pssl_{winner}_{jeudi_idx}")
+                x[(winner, jeudi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
+                model.Add(var == 1)
+                full_day_hors_site_vars.append((winner, jeudi_idx, var))
+                if winner != req.pssl_doctor:
+                    warnings.append(f"PSSL : {req.pssl_doctor} indisponible ce jeudi, repli sur {winner}.")
 
     historical_vars: Dict[tuple, Any] = {}  # (row_key, d_idx) -> {doc_id: (BoolVar, frequency)}
     historical_patterns = req.historical_patterns or {}

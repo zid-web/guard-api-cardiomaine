@@ -694,6 +694,41 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 model.Add(sum(v for v, _ in day_vars.values()) <= 1)
                 historical_vars[(row_key, d_idx)] = day_vars
 
+    # --- Créneaux fixes Cs PM / ETT ped (confirmé utilisateur 28/07/2026) ---
+    # S : ETT ped (écho pédiatrique) mercredi après-midi, sur "Apm - ETT salle 1".
+    # A : Cs PM (contrôle PM) mardi après-midi, sur "Apm - Cs PSS" (A=PSS uniquement).
+    # P : Cs PM (contrôle PM) lundi après-midi, sur "Apm - Cs PSS" (P=PSS uniquement).
+    # Robuste même si historical_patterns ne mentionne pas ces créneaux (créé
+    # directement ici, pas dépendant du mécanisme de fréquence historique) -
+    # à la différence de U (Cs PM sans jour fixe), qui reste géré par le
+    # mécanisme générique existant.
+    FIXED_CS_ETT_SLOTS = [
+        ("S", "MERCREDI", "am", "Apm - ETT salle 1"),
+        ("A", "MARDI", "am", "Apm - Cs PSS"),
+        ("P", "LUNDI", "am", "Apm - Cs PSS"),
+    ]
+    for doc_id, day_name, slot, row_key in FIXED_CS_ETT_SLOTS:
+        if doc_id not in medecins_map:
+            continue
+        d_idx = DAY_NAMES_FR.index(day_name)
+        if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
+            warnings.append(f"{row_key} ({day_name}) : {doc_id} en congé - créneau fixe non couvert cette semaine.")
+            continue
+
+        activity_name = f"HIST::{row_key}"
+        var = x.get((doc_id, d_idx, slot, activity_name))
+        if var is None:
+            var = model.NewBoolVar(f"fixed_{doc_id}_{d_idx}_{row_key}")
+            x[(doc_id, d_idx, slot, activity_name)] = var
+        model.Add(var == 1)
+
+        # Réserve exclusivement ce créneau à ce médecin : force à 0 tout
+        # autre médecin qui aurait aussi une variable sur cette même case
+        # (ex: si historical_patterns proposait quelqu'un d'autre ici).
+        for (d2, dd2, sl2, act2), v2 in list(x.items()):
+            if dd2 == d_idx and sl2 == slot and act2 == activity_name and d2 != doc_id:
+                model.Add(v2 == 0)
+
     # --- 2quater. Entrées PSS (confirmé avec l'utilisateur le 26/07/2026) ---
     # Lundi/mardi : roulement parmi les médecins affectés ce jour-là en Apm -
     # ETT salle 1/2, Apm - Stress, Apm - Cs PSS ou Apm - Cs Tessée (le "pool

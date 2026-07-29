@@ -743,6 +743,36 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if dd2 == d_idx and sl2 == slot and act2 == activity_name and d2 != doc_id:
                 model.Add(v2 == 0)
 
+    # --- Doublon Cs (préférence forte, pas absolue - confirmé utilisateur
+    # 29/07/2026) : Z lundi après-midi, H mardi après-midi - le même médecin
+    # sur 2 salles/sessions simultanées, affiché "Z²"/"H²" côté front (déjà
+    # géré par lib/slot-blocking.ts). N'entre PAS en conflit avec la capacité
+    # normale "<=1" de la case (doublon_var est une couche additionnelle, pas
+    # comptée dans cette somme) - le médecin doit déjà être présent une fois
+    # (base_var) pour pouvoir être en doublon.
+    DOUBLON_CS_CONFIG = [
+        ("Z", "LUNDI", "am", "Apm - Cs PSS"),
+        ("H", "MARDI", "am", "Apm - Cs PSS"),
+    ]
+    doublon_bonus_terms = []
+    doublon_output_pairs: List[tuple] = []  # (doc_id, d_idx, slot, row_key, doublon_var)
+    for doc_id, day_name, slot, row_key in DOUBLON_CS_CONFIG:
+        if doc_id not in medecins_map:
+            continue
+        d_idx = DAY_NAMES_FR.index(day_name)
+        if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
+            continue
+        activity_name = f"HIST::{row_key}"
+        base_var = x.get((doc_id, d_idx, slot, activity_name))
+        if base_var is None:
+            base_var = model.NewBoolVar(f"cspm_base_{doc_id}_{d_idx}_{row_key}")
+            x[(doc_id, d_idx, slot, activity_name)] = base_var
+        doublon_var = model.NewBoolVar(f"doublon_{doc_id}_{d_idx}_{row_key}")
+        model.Add(doublon_var <= base_var)  # doublon seulement si déjà présent une fois
+        doublon_bonus_terms.append(5 * doublon_var)
+        doublon_output_pairs.append((doc_id, d_idx, slot, row_key, doublon_var))
+    doublon_bonus = sum(doublon_bonus_terms) if doublon_bonus_terms else 0
+
     # --- 2quater. Entrées PSS (confirmé avec l'utilisateur le 26/07/2026) ---
     # Lundi/mardi : roulement parmi les médecins affectés ce jour-là en Apm -
     # ETT salle 1/2, Apm - Stress, Apm - Cs PSS ou Apm - Cs Tessée (le "pool
@@ -1422,6 +1452,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     historical_bonus = sum(historical_bonus_terms) if historical_bonus_terms else 0
     hors_site_bonus = sum(hors_site_priority_bonus) if hors_site_priority_bonus else 0
     reeduc_bonus = sum(reeduc_priority_bonus) if reeduc_priority_bonus else 0
+
+    # Préférence douce (pas une obligation) : P préfère la garde de nuit le
+    # mercredi (confirmé utilisateur 29/07/2026) - petit bonus, n'empêche pas
+    # P de faire garde nuit un autre jour si l'équité l'exige davantage.
+    p_mercredi_var = x.get(("P", 2, "nuit", "GARDE"))
+    p_wednesday_bonus = 3 * p_mercredi_var if p_mercredi_var is not None else 0
     entrees_pss_bonus = sum(entrees_pss_fill_bonus) if entrees_pss_fill_bonus else 0
 
     def _spread(points: Dict[str, Any], name: str):
@@ -1451,7 +1487,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + stress_quota_penalty
-        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus
+        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus
     )
 
 
@@ -1485,6 +1521,20 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     note="assigné par le solveur (historique)" if is_historical else (
                         "assigné par le solveur (hors site)" if is_hors_site else "assigné par le solveur"
                     )
+                ))
+
+        # --- Doublon Cs retenu : duplique l'assignation (le front interprète
+        # 2 occurrences du même médecin dans la case comme un doublon "²") ---
+        for doc_id, d_idx, slot, row_key, doublon_var in doublon_output_pairs:
+            if solver.Value(doublon_var) == 1:
+                clean_activity = row_key.split(" - ", 1)[1] if " - " in row_key else row_key
+                assignments.append(Assignment(
+                    date=days[d_idx].isoformat(),
+                    day_name=DAY_NAMES_FR[d_idx],
+                    slot=slot,
+                    activity=clean_activity,
+                    doctor=doc_id,
+                    note="assigné par le solveur (doublon)"
                 ))
 
         # --- Repos dynamique après garde de nuit (voir section 3bis) ---

@@ -63,6 +63,16 @@ class RoomMaintenance(BaseModel):
     slots: List[str] = ["matin", "am"]  # sous-ensemble concerné, ex: ["am"] seul
     reason: Optional[str] = None  # ex: "maintenance", informationnel uniquement
 
+class ActivityMaintenance(BaseModel):
+    """Suspension d'une activité entière sur une période (ex: NCT suspendue
+    S31-S36, hors site PSSL/LFB/CDL suspendus S28-S36) - bloque TOUT LE MONDE,
+    pas un médecin en particulier. Distinct de RoomMaintenance (dédié à Coro)
+    pour rester simple : une période + une liste d'activités concernées."""
+    start_date: str
+    end_date: str
+    activities: List[str]  # ex: ["NCT"] ou ["PSSL", "LFB", "CDL"]
+    reason: Optional[str] = None
+
 class PartialAbsence(BaseModel):
     """Absence ponctuelle d'un médecin sur un/des créneau(x) précis d'une seule
     journée - granularité plus fine qu'une Vacation (qui bloque la journée
@@ -78,6 +88,7 @@ class GenerateWeekRequest(BaseModel):
     vacations: List[Vacation] = []
     congres: List[Vacation] = []      # même structure que vacations : doctor_id, start_date, end_date
     room_maintenance: List[RoomMaintenance] = []  # salle de coro indisponible sur une période
+    activity_maintenance: List[ActivityMaintenance] = []  # NCT/PSSL/LFB/CDL suspendus sur une période (confirmé utilisateur 29/07/2026)
     partial_absences: List[PartialAbsence] = []   # absence ponctuelle par créneau précis (voir modèle ci-dessus)
     weekend_mode: Literal["CH", "ROTATION"] = "ROTATION"
     last_nct_doctor: Optional[str] = None  # W ou M
@@ -175,6 +186,19 @@ def is_room_under_maintenance(day: date, slot: str, room_maintenance: List["Room
         start = date.fromisoformat(m.start_date)
         end = date.fromisoformat(m.end_date)
         if start <= day <= end and slot in m.slots:
+            return True
+    return False
+
+
+def is_activity_suspended(day: date, activity_or_row: str, activity_maintenance: List["ActivityMaintenance"]) -> bool:
+    """Activité entière suspendue ce jour-là (NCT, ou hors site PSSL/LFB/CDL) -
+    bloque tout le monde, indépendamment du médecin. `activity_or_row` peut
+    être le nom d'activité solveur (ex: "NCT") ou le nom de la ligne hors
+    site sans préfixe (ex: "PSSL", "LFB", "CDL")."""
+    for m in activity_maintenance:
+        start = date.fromisoformat(m.start_date)
+        end = date.fromisoformat(m.end_date)
+        if start <= day <= end and activity_or_row in m.activities:
             return True
     return False
 
@@ -515,6 +539,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 return
         if activity == "NCT" and (doc_id not in NCT_ALLOWED or d_idx != 3):
             return
+        if activity == "NCT" and is_activity_suspended(day, "NCT", req.activity_maintenance):
+            return
         # Restriction demandée : la garde n'est répartie qu'entre les médecins listés
         # dans rules_config.json (garde_allowed). Ne s'applique pas à FV, dont la garde
         # fixe du lundi est déjà gérée par la règle spécifique ci-dessus.
@@ -594,6 +620,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
             for (day_name, slot), candidates in slot_candidates.items():
                 d_idx = DAY_NAMES_FR.index(day_name)
+                short_name = row_key.split(" - ", 1)[1] if " - " in row_key else row_key
+                if is_activity_suspended(days[d_idx], short_name, req.activity_maintenance):
+                    warnings.append(f"{row_key} suspendu(e) le {day_name} (maintenance) - non couvert cette semaine.")
+                    continue
                 # Ordonner selon la priorité si définie, sinon ordre donné
                 ordered = sorted(
                     candidates,
@@ -695,7 +725,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     if req.lfb_doctor:
         jeudi_idx = DAY_NAMES_FR.index("JEUDI")
         LFB_POOL = ["H", "S", "G"]
-        if req.lfb_doctor not in LFB_POOL:
+        if is_activity_suspended(days[jeudi_idx], "LFB", req.activity_maintenance):
+            warnings.append("LFB suspendu ce jeudi (maintenance) - non couvert cette semaine.")
+        elif req.lfb_doctor not in LFB_POOL:
             warnings.append(f"lfb_doctor '{req.lfb_doctor}' invalide (attendu H, S ou G) - ignoré.")
         else:
             # Repli automatique sur les 2 autres du pool si le désigné est
@@ -723,7 +755,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     if req.pssl_doctor:
         jeudi_idx = DAY_NAMES_FR.index("JEUDI")
         PSSL_POOL = ["B", "Z"]
-        if req.pssl_doctor not in PSSL_POOL:
+        if is_activity_suspended(days[jeudi_idx], "PSSL", req.activity_maintenance):
+            warnings.append("PSSL suspendu ce jeudi (maintenance) - non couvert cette semaine.")
+        elif req.pssl_doctor not in PSSL_POOL:
             warnings.append(f"pssl_doctor '{req.pssl_doctor}' invalide (attendu B ou Z) - ignoré.")
         else:
             candidates = [req.pssl_doctor] + [d for d in PSSL_POOL if d != req.pssl_doctor]
@@ -991,6 +1025,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # le même créneau - seule l'exclusion Cs/ETT/Stress avec IRM reste bloquée,
     # gérée séparément ci-dessus. Aucune de ces deux n'est une "vraie"
     # activité concurrente pour le temps du médecin.)
+    #
+    # ATL Matin/Midi Lun–Ven == Coro (section 10) : même présence physique,
+    # deux BoolVar forcés égaux. Les compter tous les deux dans l'exclusivité
+    # rend CORO+ASTREINTE=1 impossible → INFEASIBLE dès que FV (ou tout
+    # coronarographiste) a les deux vars (ex. rules_override astreinte_allowed
+    # avec FV, confirmé 29/07/2026 : "Aucune solution trouvée" + LFB en repli).
+    # On n'exclut ASTREINTE que si une var CORO existe sur le même créneau.
     for doc_id in medecins_map:
         for d_idx in range(7):
             for slot in SLOTS:
@@ -998,6 +1039,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     v for (doc, d, sl, act), v in x.items()
                     if d == d_idx and sl == slot and doc == doc_id
                     and act != entrees_pss_activity and act not in non_exclusive_activities
+                    and not (
+                        act == "ASTREINTE"
+                        and slot in ("matin", "am")
+                        and d_idx < 5
+                        and x.get((doc_id, d_idx, slot, "CORO")) is not None
+                    )
                 ]
                 if slot_vars:
                     model.Add(sum(slot_vars) <= 1)

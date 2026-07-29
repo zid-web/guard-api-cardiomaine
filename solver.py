@@ -968,12 +968,22 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 model.AddImplication(var_nct, var_astreinte_mercredi.Not())
 
     # --- 5bis. REEDUC (obligatoire, 1 médecin exactement, Lundi/Mercredi/Vendredi am) ---
+    # Mercredi : S fortement privilégié, R/K seulement en repli si S
+    # indisponible (confirmé utilisateur 28/07/2026) - même mécanisme que la
+    # priorité CDL (V>O) : bonus fort pour S, pas une exclusion de R/K, pour
+    # que le solveur les choisisse quand même si S est vraiment absent.
+    reeduc_priority_bonus = []
     for d_idx, day_nm in enumerate(DAY_NAMES_FR):
         if day_nm not in REEDUC_DAYS:
             continue
         reeduc_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == "am" and act == "REEDUC"]
         if reeduc_vars:
             model.Add(sum(reeduc_vars) == 1)
+            if day_nm == "MERCREDI":
+                for (doc, d, sl, act), v in x.items():
+                    if d == d_idx and sl == "am" and act == "REEDUC":
+                        weight = 100 if doc == "S" else 1
+                        reeduc_priority_bonus.append(weight * v)
         else:
             warnings.append(f"{day_nm} : aucun médecin disponible pour REEDUC (vacances ou exclu)")
 
@@ -1335,6 +1345,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     ]
     historical_bonus = sum(historical_bonus_terms) if historical_bonus_terms else 0
     hors_site_bonus = sum(hors_site_priority_bonus) if hors_site_priority_bonus else 0
+    reeduc_bonus = sum(reeduc_priority_bonus) if reeduc_priority_bonus else 0
     entrees_pss_bonus = sum(entrees_pss_fill_bonus) if entrees_pss_fill_bonus else 0
 
     def _spread(points: Dict[str, Any], name: str):
@@ -1364,7 +1375,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + stress_spread
-        - historical_bonus - hors_site_bonus - entrees_pss_bonus
+        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus
     )
 
 

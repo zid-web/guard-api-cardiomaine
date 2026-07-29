@@ -1,3 +1,4 @@
+
 """
 Solveur complet pour le planning Cardiomaine - Version avec alternance CH / WOM
 et préservation des saisies manuelles.
@@ -342,10 +343,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             ("U", "MERCREDI", "am"), ("U", "VENDREDI", ven_slot_u),
         ]
     else:
+        # Semaine paire, U de visite : conflit mercredi matin (U doit être en
+        # visite ce matin-là, pas en rythmo) - repli confirmé utilisateur
+        # 29/07/2026 : A prend le rythmo du mercredi MATIN à sa place, U
+        # garde uniquement l'après-midi ce mercredi-là.
+        mercredi_matin_doctor = "A" if req.visite_doctor == "U" else "U"
         RYTHMO_FORCE = [
             ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
             ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
-            ("U", "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
+            (mercredi_matin_doctor, "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
             ("P", "VENDREDI", "am"),
         ]
     NCT_ALLOWED = set(rules["nct_allowed"])

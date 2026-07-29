@@ -94,8 +94,15 @@ class GenerateWeekRequest(BaseModel):
                                           # Conséquence : pas de Cs le matin cette semaine pour ce médecin.
     lfb_doctor: Optional[str] = None  # H, S ou G : qui fait LFB ce jeudi (roulement 1/3, désigné en
                                        # entrée comme visite_doctor - même raisonnement).
-    pssl_b_active: bool = False  # B fait PSSL ce jeudi (roulement 1/3, désigné en entrée)
-    pssl_z_active: bool = False  # Z fait PSSL ce mardi (roulement 1/2, désigné en entrée)
+    pssl_doctor: Optional[str] = None  # B ou Z : qui fait PSSL ce jeudi (roulement 1/2, désigné en
+                                        # entrée - remplace pssl_b_active/pssl_z_active, confirmé
+                                        # utilisateur 29/07/2026 : B et Z alternent ENSEMBLE le jeudi,
+                                        # pas séparément sur 2 jours distincts comme précédemment codé).
+    fv_monday_night_active: bool = False  # FV fait la garde de nuit CE lundi précis (2 lundis par
+                                           # mois seulement, pas systématique - confirmé utilisateur
+                                           # 29/07/2026, remplace le forçage inconditionnel précédent).
+                                           # Si False : S ou U peuvent prendre le relais (déjà dans
+                                           # GARDE_ALLOWED, pas de liste de repli séparée nécessaire).
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -323,21 +330,23 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # Rythmo : calendrier confirmé (utilisateur + DOC022, 28/07/2026).
     # Impaire : A Lun+Jeu am ; P Mar matin+am ; U Mer am + Ven am (fixe, pas d'alternance)
     # Paire   : A Lun+Jeu am ; P Mar matin+am ; U Mer matin+am ;
-    #           Ven matin en alternance U/P selon la semaine
-    week_num = week_start.isocalendar()[1]
+    #           Ven am = P systématiquement
+    # Vendredi impaire : U normalement matin, MAIS après-midi si cette semaine
+    # coïncide avec la semaine de visite de U (confirmé utilisateur 29/07/2026,
+    # dépend donc de req.visite_doctor).
     if req.week_type == 1:
+        ven_slot_u = "am" if req.visite_doctor == "U" else "matin"
         RYTHMO_FORCE = [
             ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
             ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
-            ("U", "MERCREDI", "am"), ("U", "VENDREDI", "am"),
+            ("U", "MERCREDI", "am"), ("U", "VENDREDI", ven_slot_u),
         ]
     else:
-        ven_doc = "U" if (week_num // 2) % 2 == 1 else "P"
         RYTHMO_FORCE = [
             ("A", "LUNDI", "am"), ("A", "JEUDI", "am"),
             ("P", "MARDI", "matin"), ("P", "MARDI", "am"),
             ("U", "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
-            (ven_doc, "VENDREDI", "matin"),
+            ("P", "VENDREDI", "am"),
         ]
     NCT_ALLOWED = set(rules["nct_allowed"])
     # Restriction Cs PSS vs Cs Tessée par médecin (confirmé utilisateur
@@ -399,9 +408,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             return
 
         if doc_id == fv_id:
-            if not (d_idx == 0 and slot == "nuit" and activity == "GARDE") and \
+            if not (d_idx == 0 and slot == "nuit" and activity == "GARDE" and req.fv_monday_night_active) and \
                not (d_idx == 3 and slot == "am" and activity == "CORO") and \
                not (activity == "ASTREINTE" and doc_id in ASTREINTE_ALLOWED):
+                return
+
+        # Exclusions de garde de nuit confirmées utilisateur 29/07/2026 :
+        # O jamais mardi nuit ; M/O/W jamais vendredi nuit.
+        if activity == "GARDE" and slot == "nuit":
+            if doc_id == "O" and d_idx == 1:  # MARDI
+                return
+            if doc_id in ("M", "O", "W") and d_idx == 4:  # VENDREDI
                 return
 
         day_name = DAY_NAMES_FR[d_idx]
@@ -462,6 +479,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         # dans rules_config.json (garde_allowed). Ne s'applique pas à FV, dont la garde
         # fixe du lundi est déjà gérée par la règle spécifique ci-dessus.
         if activity == "GARDE" and doc_id != fv_id and GARDE_ALLOWED and doc_id not in GARDE_ALLOWED:
+            return
+        # GARDE weekend (samedi/dimanche) : décidée lors d'une réunion tous les
+        # 6 mois, pas par le solveur (confirmé utilisateur 29/07/2026) - saisie
+        # entièrement manuelle, aucune proposition automatique.
+        if activity == "GARDE" and d_idx in (5, 6):
             return
 
         statut = medecins_map[doc_id].statut
@@ -612,25 +634,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             model.Add(var == 1)
             full_day_hors_site_vars.append((req.lfb_doctor, jeudi_idx, var))
 
-    if req.pssl_b_active:
+    if req.pssl_doctor:
         jeudi_idx = DAY_NAMES_FR.index("JEUDI")
-        if is_on_vacation("B", days[jeudi_idx], req.vacations) or is_on_vacation("B", days[jeudi_idx], req.congres):
-            warnings.append("PSSL : B en congé ce jeudi - créneau non couvert cette semaine.")
-        elif "B" in medecins_map:
-            var = model.NewBoolVar("pssl_b")
-            x[("B", jeudi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
+        if req.pssl_doctor not in ("B", "Z"):
+            warnings.append(f"pssl_doctor '{req.pssl_doctor}' invalide (attendu B ou Z) - ignoré.")
+        elif is_on_vacation(req.pssl_doctor, days[jeudi_idx], req.vacations) or is_on_vacation(req.pssl_doctor, days[jeudi_idx], req.congres):
+            warnings.append(f"PSSL : {req.pssl_doctor} en congé ce jeudi - créneau non couvert cette semaine.")
+        elif req.pssl_doctor in medecins_map:
+            var = model.NewBoolVar(f"pssl_{req.pssl_doctor}_{jeudi_idx}")
+            x[(req.pssl_doctor, jeudi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
             model.Add(var == 1)
-            full_day_hors_site_vars.append(("B", jeudi_idx, var))
-
-    if req.pssl_z_active:
-        mardi_idx = DAY_NAMES_FR.index("MARDI")
-        if is_on_vacation("Z", days[mardi_idx], req.vacations) or is_on_vacation("Z", days[mardi_idx], req.congres):
-            warnings.append("PSSL : Z en congé ce mardi - créneau non couvert cette semaine.")
-        elif "Z" in medecins_map:
-            var = model.NewBoolVar("pssl_z")
-            x[("Z", mardi_idx, "matin", "HORSSITE::Hors site - PSSL")] = var
-            model.Add(var == 1)
-            full_day_hors_site_vars.append(("Z", mardi_idx, var))
+            full_day_hors_site_vars.append((req.pssl_doctor, jeudi_idx, var))
 
     historical_vars: Dict[tuple, Any] = {}  # (row_key, d_idx) -> {doc_id: (BoolVar, frequency)}
     historical_patterns = req.historical_patterns or {}
@@ -1024,10 +1038,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     # --- 6. Fixes forcés (FV) ---
     if fv_id:
-        for d_idx, slot, act, forced_val in [
-            (0, "nuit", "GARDE", 1),
-            (3, "am", "CORO", 1),
-        ]:
+        forced_list = [(3, "am", "CORO", 1)]
+        if req.fv_monday_night_active:
+            forced_list.append((0, "nuit", "GARDE", 1))
+        for d_idx, slot, act, forced_val in forced_list:
             var = x.get((fv_id, d_idx, slot, act))
             if var is not None:
                 model.Add(var == forced_val)
@@ -1363,7 +1377,34 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     cs_points = _groupe1_points(CS_ROW_KEYS, lambda m: m.points_cs, "cs")
     ett_points = _groupe1_points(ETT_ROW_KEYS, lambda m: m.points_ett, "ett")
-    stress_points = _groupe1_points(STRESS_ROW_KEYS, lambda m: m.points_stress, "stress")
+    # Stress RETIRÉ de l'équité groupe 1 (confirmé utilisateur 29/07/2026) :
+    # ce n'est pas une répartition égale mais un QUOTA fixe assumé inégal
+    # (K=3, B/S/H/G/Z=1 chacun quand K est présent) - voir plus bas.
+
+    # --- Quota Stress (K=3, B/S/H/G/Z=1 chacun si K présent) ---
+    # PAS une équité de spread : un quota fixe assumé inégal. Pénalise l'écart
+    # à la cible plutôt que de chercher l'égalité entre tous.
+    STRESS_QUOTA = {"K": 3, "B": 1, "S": 1, "H": 1, "G": 1, "Z": 1}
+    stress_quota_terms = []
+    if "K" in medecins_map:
+        for doc, target in STRESS_QUOTA.items():
+            if doc not in medecins_map:
+                continue
+            count_vars = [
+                var
+                for (row_key, d_idx), day_vars in historical_vars.items()
+                if row_key in STRESS_ROW_KEYS
+                for doc_id_x, (var, _freq) in day_vars.items()
+                if doc_id_x == doc
+            ]
+            if not count_vars:
+                continue
+            count_expr = sum(count_vars)
+            dev = model.NewIntVar(0, 10, f"stress_dev_{doc}")
+            model.Add(dev >= count_expr - target)
+            model.Add(dev >= target - count_expr)
+            stress_quota_terms.append(dev)
+    stress_quota_penalty = sum(stress_quota_terms) if stress_quota_terms else 0
 
     # --- Bonus de fidélité historique (Cs/ETT/EE/hors site) ---
     # Récompense (dans l'objectif, donc soustrait puisqu'on minimise) le fait
@@ -1397,19 +1438,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     astreinte_g3_spread = _spread(astreinte_g3_points, "astreinte_g3")
     cs_spread = _spread(cs_points, "cs")
     ett_spread = _spread(ett_points, "ett")
-    stress_spread = _spread(stress_points, "stress")
 
     # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
     # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
     # ASTREINTE du groupe 3 (poids plus léger, 3 personnes chacune), l'équité
-    # Cs/ETT/Stress du groupe 1 (poids léger également, 5 personnes), le
-    # bonus de fidélité historique (Cs/ETT/EE), la priorité hors site (ex:
-    # CDL, V > O) et la préférence de remplissage Entrées PSS - en une seule
-    # expression additive, chaque terme portant sur des activités disjointes
-    # (pas de double comptage entre eux).
+    # Cs/ETT du groupe 1 (poids léger également, 5 personnes), le quota fixe
+    # Stress (K=3, autres=1 - pas une égalité, une pénalité d'écart à la
+    # cible), le bonus de fidélité historique (Cs/ETT/EE), la priorité hors
+    # site (ex: CDL, V > O) et la préférence de remplissage Entrées PSS - en
+    # une seule expression additive, chaque terme portant sur des activités
+    # disjointes (pas de double comptage entre eux).
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
-        + cs_spread + ett_spread + stress_spread
+        + cs_spread + ett_spread + stress_quota_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus
     )
 

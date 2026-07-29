@@ -431,11 +431,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 return
 
         # Exclusions de garde de nuit confirmées utilisateur 29/07/2026 :
-        # O jamais mardi nuit ; M/O/W jamais vendredi nuit.
+        # O jamais mardi nuit ; M/O/W jamais vendredi nuit ; S jamais mardi nuit.
         if activity == "GARDE" and slot == "nuit":
             if doc_id == "O" and d_idx == 1:  # MARDI
                 return
             if doc_id in ("M", "O", "W") and d_idx == 4:  # VENDREDI
+                return
+            if doc_id == "S" and d_idx == 1:  # MARDI (confirmé utilisateur 29/07/2026)
                 return
             # Jamais garde de nuit le jour d'un engagement fixe l'après-midi
             # du même médecin (ETT ped, Cs PM, doublon) - éviterait sinon une
@@ -467,6 +469,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if _is_rythmo_day(doc_id, next_day_name):
                 target_off = target_off_slot_after_night_guard(doc_id, next_day_name)
                 if target_off in _rythmo_slots_for(doc_id, next_day_name):
+                    return
+            # Même logique pour les engagements fixes après-midi (ETT ped,
+            # Cs PM, doublon) : le repos automatique du lendemain cible "am"
+            # par défaut, ce qui chevauche directement ces créneaux fixes -
+            # confirmé bug réel le 29/07/2026 (2e chemin, distinct du conflit
+            # même-jour déjà corrigé).
+            if (doc_id, next_day_name) in FIXED_AFTERNOON_COMMITMENT_DAYS:
+                target_off = target_off_slot_after_night_guard(doc_id, next_day_name)
+                if target_off == "am":
                     return
 
         if doc_id in fixed_exclusions and d_idx in fixed_exclusions[doc_id]:

@@ -1,4 +1,3 @@
-
 """
 Solveur complet pour le planning Cardiomaine - Version avec alternance CH / WOM
 et préservation des saisies manuelles.
@@ -462,6 +461,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 return
             eligible_today = REEDUC_ALLOWED | REEDUC_ALLOWED_EXTRA_BY_DAY.get(day_name, set())
             if doc_id not in eligible_today:
+                return
+            # S est toujours occupé sur ETT ped le mercredi après-midi (créneau
+            # fixe, voir FIXED_CS_ETT_SLOTS) - jamais éligible à REEDUC ce
+            # jour-là, sous peine de contradiction directe si R et K sont
+            # tous deux indisponibles (S resterait le seul candidat REEDUC
+            # tout en étant déjà forcé sur ETT ped -> infaisabilité).
+            if doc_id == "S" and day_name == "MERCREDI":
                 return
         if activity == "CORO" and doc_id not in CORO_ALLOWED:
             return

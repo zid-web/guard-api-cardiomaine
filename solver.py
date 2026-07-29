@@ -399,6 +399,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     def _rythmo_slots_for(doc_id: str, day_name: str) -> Tuple[str, ...]:
         return tuple(slot for d, day, slot in RYTHMO_FORCE if d == doc_id and day == day_name)
 
+    # Jours (pas encore les vars) des créneaux fixes Cs/ETT/doublon - utilisé
+    # ci-dessous pour empêcher qu'un médecin soit affecté en garde de nuit un
+    # jour où il a par ailleurs un engagement fixe l'après-midi (conflit avec
+    # la règle 7.2 "garde nuit -> pas d'activité l'am ce jour-là" sinon,
+    # confirmé bug réel le 29/07/2026 : S garde nuit mercredi + ETT ped
+    # mercredi = infaisable).
+    FIXED_AFTERNOON_COMMITMENT_DAYS = {
+        ("S", "MERCREDI"), ("A", "MARDI"), ("P", "LUNDI"),  # FIXED_CS_ETT_SLOTS
+        ("Z", "LUNDI"), ("H", "MARDI"),                      # DOUBLON_CS_CONFIG
+    }
+
     def add_var_if_allowed(doc_id: str, d_idx: int, slot: str, activity: str):
         day = days[d_idx]
         if is_on_vacation(doc_id, day, req.vacations):
@@ -425,6 +436,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if doc_id == "O" and d_idx == 1:  # MARDI
                 return
             if doc_id in ("M", "O", "W") and d_idx == 4:  # VENDREDI
+                return
+            # Jamais garde de nuit le jour d'un engagement fixe l'après-midi
+            # du même médecin (ETT ped, Cs PM, doublon) - éviterait sinon une
+            # contradiction directe avec la règle 7.2.
+            if (doc_id, DAY_NAMES_FR[d_idx]) in FIXED_AFTERNOON_COMMITMENT_DAYS:
                 return
 
         day_name = DAY_NAMES_FR[d_idx]
@@ -1170,22 +1186,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         _force_rythmo(doc_id, day_name, slot)
 
     # --- 7. Règles d'exclusion métier ---
-    # 7.1 AM OFF après garde nuit (lendemain matin) - pas Ven->Sam
-    # (Sam Garde Matin = Ven Garde Nuit, couplage dédié en 10bis, 28/07/2026).
-    for doc_id in medecins_map:
-        for d_idx in range(5):  # LUNDI→VENDREDI seulement
-            var_nuit_garde = x.get((doc_id, d_idx, "nuit", "GARDE"))
-            if var_nuit_garde is None:
-                continue
-            am_next_vars = [
-                v for (doc, d, sl, act), v in x.items()
-                if d == d_idx + 1 and sl == "matin" and doc == doc_id and act != "GARDE"
-            ]
-            if am_next_vars:
-                presence_matin = model.NewBoolVar(f"presence_matin_{doc_id}_{d_idx+1}")
-                model.Add(sum(am_next_vars) >= 1).OnlyEnforceIf(presence_matin)
-                model.Add(sum(am_next_vars) == 0).OnlyEnforceIf(presence_matin.Not())
-                model.AddImplication(var_nuit_garde, presence_matin.Not())
+    # 7.1 retirée (28/07/2026) : redondante avec la section 3bis (repos
+    # dynamique après garde de nuit) et incorrecte - elle bloquait
+    # inconditionnellement le MATIN du lendemain, alors que la vraie règle
+    # métier confirmée libère l'APRÈS-MIDI (voir target_off_slot_after_night_
+    # guard). Cette section entrait en conflit avec toute activité fixe du
+    # matin (ex: LFB en repli) le lendemain d'une garde de nuit, causant des
+    # "Aucune solution trouvée" évitables.
 
     # 7.2 Garde nuit => pas d'activité sur AM le même jour
     for doc_id in medecins_map:

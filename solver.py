@@ -114,6 +114,14 @@ class GenerateWeekRequest(BaseModel):
                                            # 29/07/2026, remplace le forçage inconditionnel précédent).
                                            # Si False : S ou U peuvent prendre le relais (déjà dans
                                            # GARDE_ALLOWED, pas de liste de repli séparée nécessaire).
+    weekend_astreinte_combo: bool = False  # Ce weekend (semaine WOM uniquement) est un weekend
+                                            # "combo" garde+astreinte entre 2 des 3 coronarographistes
+                                            # (~10 weekends/6 mois, désignés en entrée - confirmé
+                                            # utilisateur 30/07/2026, même raisonnement que VISITE).
+    weekend_combo_astreinte_anchor: Optional[str] = None  # M, O ou W : fait astreinte (ven nuit +
+                                                            # sam matin/midi/nuit) + garde dimanche
+    weekend_combo_garde_anchor: Optional[str] = None  # M, O ou W (différent de l'ancre astreinte) :
+                                                        # fait garde samedi + astreinte dimanche
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -547,10 +555,18 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if activity == "GARDE" and doc_id != fv_id and GARDE_ALLOWED and doc_id not in GARDE_ALLOWED:
             return
         # GARDE weekend (samedi/dimanche) : décidée lors d'une réunion tous les
-        # 6 mois, pas par le solveur (confirmé utilisateur 29/07/2026) - saisie
-        # entièrement manuelle, aucune proposition automatique.
+        # 6 mois, pas par le solveur (confirmé utilisateur 29/07/2026) - SAUF
+        # weekend "combo" désigné en entrée (confirmé utilisateur 30/07/2026),
+        # où les 2 ancres (astreinte/garde) ont exactement une garde chacune
+        # ce weekend (dimanche pour l'ancre astreinte, samedi pour l'ancre
+        # garde) - forcé plus loin, section 9.
         if activity == "GARDE" and d_idx in (5, 6):
-            return
+            if req.weekend_astreinte_combo and doc_id in (
+                req.weekend_combo_astreinte_anchor, req.weekend_combo_garde_anchor
+            ):
+                pass  # autorisé, forcé précisément plus loin
+            else:
+                return
 
         statut = medecins_map[doc_id].statut
         if statut == StatutMedecin.CH:
@@ -1080,7 +1096,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
 
     for doc_id in medecins_map:
-        for d_idx in range(5):  # LUNDI(0) à VENDREDI(4) - pas Ven->Sam, voir 10bis (couplage weekend dédié, 28/07/2026)
+        for d_idx in range(4):  # LUNDI(0) à JEUDI(3) - PAS vendredi (Ven->Sam
+                                 # est un cas weekend dédié, voir 10bis / combo
+                                 # M-O-W, ne doit jamais être doublement bloqué ici)
             night_vars = [
                 v for (doc, d, sl, act), v in x.items()
                 if doc == doc_id and d == d_idx and sl == "nuit" and act in ("GARDE", "ASTREINTE")
@@ -1272,13 +1290,20 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # matin (ex: LFB en repli) le lendemain d'une garde de nuit, causant des
     # "Aucune solution trouvée" évitables.
 
-    # 7.2 Garde nuit => pas d'activité sur AM le même jour
+    # 7.2 Garde nuit => pas d'ACTIVITÉ AUTRE sur AM le même jour (exclut GARDE
+    # elle-même : un médecin peut légitimement faire GARDE nuit+am+matin le
+    # même jour d'affilée - ex: weekend combo M/O/W - sans que ce soit
+    # "une autre activité". Bug corrigé le 30/07/2026, même classe que le
+    # correctif précédent sur l'exclusion Cs/ETT/Stress.)
     for doc_id in medecins_map:
         for d_idx in range(7):
             var_nuit_garde = x.get((doc_id, d_idx, "nuit", "GARDE"))
             if var_nuit_garde is None:
                 continue
-            am_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == "am" and doc == doc_id]
+            am_vars = [
+                v for (doc, d, sl, act), v in x.items()
+                if d == d_idx and sl == "am" and doc == doc_id and act != "GARDE"
+            ]
             if am_vars:
                 presence_am = model.NewBoolVar(f"presence_am_{doc_id}_{d_idx}")
                 model.Add(sum(am_vars) >= 1).OnlyEnforceIf(presence_am)
@@ -1369,27 +1394,83 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         if var_other is not None:
                             model.Add(var_other == 0)
     else:
-        # WOM sur les astreintes du weekend (Matin, AM, Nuit)
-        for d_idx in [5, 6]:
-            for slot in ["matin", "am", "nuit"]:
-                wom_vars = []
-                for doc in wom_pool:
-                    var = x.get((doc, d_idx, slot, "ASTREINTE"))
-                    if var is not None:
-                        wom_vars.append(var)
-                # Interdire les autres médecins
-                for doc in medecins_map:
-                    if doc not in wom_pool:
-                        var_other = x.get((doc, d_idx, slot, "ASTREINTE"))
-                        if var_other is not None:
-                            model.Add(var_other == 0)
-                if wom_vars:
-                    model.Add(sum(wom_vars) == 1)
+        # Weekend "combo" (confirmé utilisateur 30/07/2026) : 2 des 3
+        # coronarographistes se répartissent astreinte ET garde sur le
+        # weekend, désignés en entrée (~10 weekends/6 mois, hors mémoire du
+        # solveur). L'ancre astreinte fait ven nuit + sam (matin/midi/nuit)
+        # en astreinte, puis dimanche (matin/midi/nuit) en GARDE. L'ancre
+        # garde fait l'inverse : samedi (matin/midi/nuit) en GARDE, dimanche
+        # (matin/midi/nuit) en astreinte. Le 3e membre du pool WOM n'a ni
+        # l'un ni l'autre ce weekend-là.
+        combo_active = (
+            req.weekend_astreinte_combo
+            and req.weekend_combo_astreinte_anchor in wom_pool
+            and req.weekend_combo_garde_anchor in wom_pool
+            and req.weekend_combo_astreinte_anchor != req.weekend_combo_garde_anchor
+        )
+        if combo_active:
+            a_anchor = req.weekend_combo_astreinte_anchor
+            g_anchor = req.weekend_combo_garde_anchor
+
+            def _force(doc_id_target: str, d_idx: int, slot: str, activity: str, val: int):
+                var = x.get((doc_id_target, d_idx, slot, activity))
+                if var is not None:
+                    model.Add(var == val)
                 else:
-                    warnings.append(f"Weekend {DAY_NAMES_FR[d_idx]} {slot} : aucun médecin W/O/M disponible, CH utilisé")
-                    var_ch = x.get(("CH", d_idx, slot, "ASTREINTE"))
-                    if var_ch is not None:
-                        model.Add(var_ch == 1)
+                    warnings.append(
+                        f"Weekend combo : créneau {DAY_NAMES_FR[d_idx]} {slot} {activity} "
+                        f"non disponible pour {doc_id_target}."
+                    )
+
+            # Vendredi nuit : ancre astreinte forcée (au lieu du choix WOM générique)
+            for doc in wom_pool:
+                _force(doc, 4, "nuit", "ASTREINTE", 1 if doc == a_anchor else 0)
+            # Samedi : ancre astreinte en ASTREINTE, ancre garde en GARDE
+            for slot in ("matin", "am", "nuit"):
+                for doc in wom_pool:
+                    _force(doc, 5, slot, "ASTREINTE", 1 if doc == a_anchor else 0)
+                _force(g_anchor, 5, slot, "GARDE", 1)
+                _force(a_anchor, 5, slot, "GARDE", 0)  # explicite, pas juste laissé libre
+            # Dimanche : ancre garde en ASTREINTE, ancre astreinte en GARDE (inversion)
+            for slot in ("matin", "am", "nuit"):
+                for doc in wom_pool:
+                    _force(doc, 6, slot, "ASTREINTE", 1 if doc == g_anchor else 0)
+                _force(a_anchor, 6, slot, "GARDE", 1)
+                _force(g_anchor, 6, slot, "GARDE", 0)  # explicite, pas juste laissé libre
+        else:
+            # WOM sur les astreintes du weekend (Matin, AM, Nuit) - non-combo :
+            # équité 6 mois déjà gérée par astreinte_g3_spread (objectif),
+            # laisser le solveur choisir librement qui de M/O/W est le mieux
+            # placé plutôt que de désigner quelqu'un en dur.
+            for d_idx in [5, 6]:
+                for slot in ["matin", "am", "nuit"]:
+                    wom_vars = []
+                    for doc in wom_pool:
+                        var = x.get((doc, d_idx, slot, "ASTREINTE"))
+                        if var is not None:
+                            wom_vars.append(var)
+                    # Interdire les autres médecins
+                    for doc in medecins_map:
+                        if doc not in wom_pool:
+                            var_other = x.get((doc, d_idx, slot, "ASTREINTE"))
+                            if var_other is not None:
+                                model.Add(var_other == 0)
+                    if wom_vars:
+                        model.Add(sum(wom_vars) == 1)
+                    else:
+                        warnings.append(f"Weekend {DAY_NAMES_FR[d_idx]} {slot} : aucun médecin W/O/M disponible, CH utilisé")
+                        var_ch = x.get(("CH", d_idx, slot, "ASTREINTE"))
+                        if var_ch is not None:
+                            model.Add(var_ch == 1)
+
+            # Astreinte nuit vendredi = astreinte nuit samedi, même médecin
+            # (confirmé utilisateur 30/07/2026) - cas non-combo uniquement, le
+            # combo gère déjà ça explicitement dans sa propre branche.
+            for doc in wom_pool:
+                v_ven = x.get((doc, 4, "nuit", "ASTREINTE"))
+                v_sam = x.get((doc, 5, "nuit", "ASTREINTE"))
+                if v_ven is not None and v_sam is not None:
+                    model.Add(v_ven == v_sam)
 
     # --- 10. Préservation des saisies manuelles ---
     if req.existing_schedule:

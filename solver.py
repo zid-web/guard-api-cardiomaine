@@ -118,10 +118,21 @@ class GenerateWeekRequest(BaseModel):
                                             # "combo" garde+astreinte entre 2 des 3 coronarographistes
                                             # (~10 weekends/6 mois, désignés en entrée - confirmé
                                             # utilisateur 30/07/2026, même raisonnement que VISITE).
-    weekend_combo_astreinte_anchor: Optional[str] = None  # M, O ou W : fait astreinte (ven nuit +
-                                                            # sam matin/midi/nuit) + garde dimanche
-    weekend_combo_garde_anchor: Optional[str] = None  # M, O ou W (différent de l'ancre astreinte) :
-                                                        # fait garde samedi + astreinte dimanche
+    weekend_combo_astreinte_anchor: Optional[str] = None  # M, O ou W : PRÉFÉRENCE pour faire astreinte
+                                                            # (ven nuit + sam matin/midi/nuit) + garde
+                                                            # dimanche - souple (confirmé utilisateur
+                                                            # 30/07/2026) : si absent(e)/en formation ce
+                                                            # weekend, le solveur ajuste automatiquement
+                                                            # parmi les 2 autres membres du pool WOM.
+    weekend_combo_garde_anchor: Optional[str] = None  # M, O ou W : PRÉFÉRENCE pour faire garde samedi +
+                                                        # astreinte dimanche - même souplesse que ci-dessus.
+    last_combo_garde_doctor: Optional[str] = None  # Dernier médecin ayant fait le rôle "garde" d'un
+                                                     # weekend combo (M, O ou W) - pour éviter 2 fois le
+                                                     # même à moins de 15 jours d'intervalle (confirmé
+                                                     # utilisateur 30/07/2026, même logique que last_nct_doctor).
+    last_combo_garde_date: Optional[str] = None  # Date (YYYY-MM-DD) du dernier weekend combo effectué
+                                                   # par last_combo_garde_doctor - sert à calculer l'écart
+                                                   # de 15 jours.
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -561,15 +572,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         # ce weekend (dimanche pour l'ancre astreinte, samedi pour l'ancre
         # garde) - forcé plus loin, section 9.
         if activity == "GARDE" and d_idx in (5, 6):
-            is_combo_anchor = req.weekend_astreinte_combo and doc_id in (
-                req.weekend_combo_astreinte_anchor, req.weekend_combo_garde_anchor
-            )
+            is_combo_wom_member = req.weekend_astreinte_combo and doc_id in wom_pool
             garde_row = {"matin": "Garde Matin", "am": "Garde Midi", "nuit": "Garde Nuit"}.get(slot)
             is_manual_entry = (
                 garde_row is not None
                 and doc_id in (req.existing_schedule or {}).get(f"{garde_row}||{DAY_NAMES_FR[d_idx]}", [])
             )
-            if not (is_combo_anchor or is_manual_entry):
+            if not (is_combo_wom_member or is_manual_entry):
                 return
 
         statut = medecins_map[doc_id].statut
@@ -609,6 +618,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # ne pas créer deux jeux de variables concurrents pour la même case.
     hors_site_vars: Dict[tuple, Any] = {}  # (row_key, d_idx) -> {doc_id: BoolVar}
     hors_site_priority_bonus = []
+    combo_priority_bonus = []  # préférence souple pour les ancres combo weekend désignées
     full_day_hors_site_vars: List[tuple] = []  # (doc_id, d_idx, var) - appliqué après création de toutes les vars
     non_exclusive_activities: Set[str] = set()  # activités exemptées de "une activité par créneau" (ex: IRM)
     # Exemptions ciblées (médecin, jour, activité) - contrairement à
@@ -1406,41 +1416,70 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         # garde fait l'inverse : samedi (matin/midi/nuit) en GARDE, dimanche
         # (matin/midi/nuit) en astreinte. Le 3e membre du pool WOM n'a ni
         # l'un ni l'autre ce weekend-là.
-        combo_active = (
-            req.weekend_astreinte_combo
-            and req.weekend_combo_astreinte_anchor in wom_pool
-            and req.weekend_combo_garde_anchor in wom_pool
-            and req.weekend_combo_astreinte_anchor != req.weekend_combo_garde_anchor
-        )
+        combo_active = req.weekend_astreinte_combo
         if combo_active:
-            a_anchor = req.weekend_combo_astreinte_anchor
-            g_anchor = req.weekend_combo_garde_anchor
-
-            def _force(doc_id_target: str, d_idx: int, slot: str, activity: str, val: int):
-                var = x.get((doc_id_target, d_idx, slot, activity))
-                if var is not None:
-                    model.Add(var == val)
-                else:
-                    warnings.append(
-                        f"Weekend combo : créneau {DAY_NAMES_FR[d_idx]} {slot} {activity} "
-                        f"non disponible pour {doc_id_target}."
-                    )
-
-            # Vendredi nuit : ancre astreinte forcée (au lieu du choix WOM générique)
+            # Weekend "combo" souple (confirmé utilisateur 30/07/2026) : les
+            # ancres désignées sont des PRÉFÉRENCES, pas des forçages - si
+            # l'ancre habituelle est absente (congé, formation), le solveur
+            # réattribue automatiquement les rôles parmi les membres WOM
+            # disponibles. Rôles modélisés par variable : is_astreinte_anchor
+            # (ven nuit + sam ASTREINTE + dim GARDE) et is_garde_anchor (sam
+            # GARDE + dim ASTREINTE), exactement 1 de chaque, jamais la même
+            # personne aux deux rôles.
+            is_astreinte_anchor: Dict[str, Any] = {}
+            is_garde_anchor: Dict[str, Any] = {}
             for doc in wom_pool:
-                _force(doc, 4, "nuit", "ASTREINTE", 1 if doc == a_anchor else 0)
-            # Samedi : ancre astreinte en ASTREINTE, ancre garde en GARDE
-            for slot in ("matin", "am", "nuit"):
-                for doc in wom_pool:
-                    _force(doc, 5, slot, "ASTREINTE", 1 if doc == a_anchor else 0)
-                _force(g_anchor, 5, slot, "GARDE", 1)
-                _force(a_anchor, 5, slot, "GARDE", 0)  # explicite, pas juste laissé libre
-            # Dimanche : ancre garde en ASTREINTE, ancre astreinte en GARDE (inversion)
-            for slot in ("matin", "am", "nuit"):
-                for doc in wom_pool:
-                    _force(doc, 6, slot, "ASTREINTE", 1 if doc == g_anchor else 0)
-                _force(a_anchor, 6, slot, "GARDE", 1)
-                _force(g_anchor, 6, slot, "GARDE", 0)  # explicite, pas juste laissé libre
+                fri_nuit_astreinte = x.get((doc, 4, "nuit", "ASTREINTE"))
+                if fri_nuit_astreinte is None:
+                    continue  # indisponible ce weekend (congé/formation) - ne peut jouer aucun rôle
+                is_astreinte_anchor[doc] = model.NewBoolVar(f"combo_astreinte_anchor_{doc}")
+                is_garde_anchor[doc] = model.NewBoolVar(f"combo_garde_anchor_{doc}")
+                model.Add(is_astreinte_anchor[doc] + is_garde_anchor[doc] <= 1)
+
+                model.Add(fri_nuit_astreinte == is_astreinte_anchor[doc])
+                for slot in ("matin", "am", "nuit"):
+                    v_sam_astr = x.get((doc, 5, slot, "ASTREINTE"))
+                    if v_sam_astr is not None:
+                        model.Add(v_sam_astr == is_astreinte_anchor[doc])
+                    v_dim_garde = x.get((doc, 6, slot, "GARDE"))
+                    if v_dim_garde is not None:
+                        model.Add(v_dim_garde == is_astreinte_anchor[doc])
+                    v_sam_garde = x.get((doc, 5, slot, "GARDE"))
+                    if v_sam_garde is not None:
+                        model.Add(v_sam_garde == is_garde_anchor[doc])
+                    v_dim_astr = x.get((doc, 6, slot, "ASTREINTE"))
+                    if v_dim_astr is not None:
+                        model.Add(v_dim_astr == is_garde_anchor[doc])
+
+            if is_astreinte_anchor:
+                model.Add(sum(is_astreinte_anchor.values()) == 1)
+            else:
+                warnings.append("Weekend combo : aucun médecin W/O/M disponible pour le rôle astreinte.")
+            if is_garde_anchor:
+                model.Add(sum(is_garde_anchor.values()) == 1)
+            else:
+                warnings.append("Weekend combo : aucun médecin W/O/M disponible pour le rôle garde.")
+
+            # Préférence souple pour les ancres désignées (bonus, pas forcé)
+            if req.weekend_combo_astreinte_anchor in is_astreinte_anchor:
+                combo_priority_bonus.append(20 * is_astreinte_anchor[req.weekend_combo_astreinte_anchor])
+            if req.weekend_combo_garde_anchor in is_garde_anchor:
+                combo_priority_bonus.append(20 * is_garde_anchor[req.weekend_combo_garde_anchor])
+
+            # Éviter 2 rôles "garde" combo successifs pour le même médecin à
+            # moins de 15 jours d'intervalle (confirmé utilisateur 30/07/2026)
+            if req.last_combo_garde_doctor and req.last_combo_garde_date and req.last_combo_garde_doctor in is_garde_anchor:
+                last_date = date.fromisoformat(req.last_combo_garde_date)
+                gap_days = (days[5] - last_date).days
+                if 0 <= gap_days < 15:
+                    remaining_candidates = [d for d in is_garde_anchor if d != req.last_combo_garde_doctor]
+                    if remaining_candidates:
+                        model.Add(is_garde_anchor[req.last_combo_garde_doctor] == 0)
+                    else:
+                        warnings.append(
+                            f"Weekend combo : {req.last_combo_garde_doctor} a fait garde combo il y a "
+                            f"moins de 15 jours, mais aucun autre candidat disponible - repris quand même."
+                        )
         else:
             # WOM sur les astreintes du weekend (Matin, AM, Nuit) - non-combo :
             # équité 6 mois déjà gérée par astreinte_g3_spread (objectif),
@@ -1736,10 +1775,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # site (ex: CDL, V > O) et la préférence de remplissage Entrées PSS - en
     # une seule expression additive, chaque terme portant sur des activités
     # disjointes (pas de double comptage entre eux).
+    combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + stress_quota_penalty
-        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus
+        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
     )
 
 

@@ -1,0 +1,29 @@
+diff --git a/solver.py b/solver.py
+--- a/solver.py
++++ b/solver.py
+@@ -991,6 +991,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
+     # le même créneau - seule l'exclusion Cs/ETT/Stress avec IRM reste bloquée,
+     # gérée séparément ci-dessus. Aucune de ces deux n'est une "vraie"
+     # activité concurrente pour le temps du médecin.)
++    #
++    # ATL Matin/Midi Lun–Ven == Coro (section 10) pour M/O/W : même présence,
++    # deux BoolVar forcés égaux. Les compter tous les deux dans l'exclusivité
++    # rend CORO+ASTREINTE=1 impossible → INFEASIBLE / Coro jamais retenu.
++    # (FV n'est PAS dans astreinte_allowed — Coro jeudi seul, pas d'ATL.)
++    # On n'exclut ASTREINTE que si une var CORO existe sur le même créneau.
+     for doc_id in medecins_map:
+         for d_idx in range(7):
+             for slot in SLOTS:
+@@ -998,6 +1005,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
+                     v for (doc, d, sl, act), v in x.items()
+                     if d == d_idx and sl == slot and doc == doc_id
+                     and act != entrees_pss_activity and act not in non_exclusive_activities
++                    and not (
++                        act == "ASTREINTE"
++                        and slot in ("matin", "am")
++                        and d_idx < 5
++                        and x.get((doc_id, d_idx, slot, "CORO")) is not None
++                    )
+                 ]
+                 if slot_vars:
+                     model.Add(sum(slot_vars) <= 1)

@@ -49,7 +49,7 @@ class VoiceCommandRequest(BaseModel):
 
 
 class ParsedCommand(BaseModel):
-    command_type: str = "assignment"  # "assignment" | "room_maintenance" | "partial_absence"
+    command_type: str = "assignment"  # "assignment" | "room_maintenance" | "partial_absence" | "removal"
     date: str                      # YYYY-MM-DD résolu (date de début pour room_maintenance)
     slot: str                      # "matin" | "am" | "nuit" (ignoré pour room_maintenance)
     activity: str                  # "ASTREINTE" | "GARDE" | "CORO" | "NCT" (ignoré hors "assignment")
@@ -80,7 +80,7 @@ médical de gardes/astreintes/vacations, en une instruction JSON strictement str
 
 Réponds UNIQUEMENT avec un objet JSON valide, sans texte avant ni après, sans balises markdown.
 
-Il existe TROIS types de consigne possibles, distingués par "command_type" :
+Il existe QUATRE types de consigne possibles, distingués par "command_type" :
 
 **1. "assignment" (le plus fréquent - affectation/remplacement d'un médecin)**
 {
@@ -129,6 +129,21 @@ Déclenché par des expressions comme "S est absent demain matin seulement", "A 
   "confidence": "high" | "low"
 }
 
+**4. "removal" (VIDER une case sans désigner de remplaçant - différent d'un
+remplacement où un autre médecin prend la place)**
+Déclenché par des expressions comme "retire S de la garde de mardi", "vide la case CDL de mardi",
+"enlève tout le monde de cette case", "annule l'affectation de X mercredi" - SANS mention d'un
+médecin qui prendrait la place.
+{
+  "command_type": "removal",
+  "date": "YYYY-MM-DD",
+  "slot": "matin" | "am" | "nuit",
+  "activity": "ASTREINTE" | "GARDE" | "CORO" | "NCT" | "RYTHMO" | etc.,
+  "doctor_out": "CODE_MEDECIN",      // le médecin actuellement présent qu'on retire (si connu/mentionné)
+  "doctor_in": null,                  // TOUJOURS null pour ce type - personne ne prend la place
+  "confidence": "high" | "low"
+}
+
 Règles générales :
 - Résous les expressions relatives ("demain", "après-demain", "lundi prochain") à partir de la date de référence fournie.
 - Les codes médecins doivent être EXACTEMENT l'un de ceux fournis dans la liste des médecins connus. \
@@ -152,6 +167,8 @@ d'un autre médecin), mets "doctor_out": null.
 Ne renvoie JAMAIS null ni omis pour "doctor_in" dans ce cas. Pour un retrait sans remplaçant, mets doctor_in \
 au médecin concerné avec activity VACANCES/CONGE, ou reformule — jamais doctor_in=null pour une "assignment".
 - Pour command_type "room_maintenance" : doctor_in DOIT être null (aucun médecin concerné).
+- Pour command_type "removal" : doctor_in DOIT être null (personne ne prend la place) ;
+doctor_out doit identifier le médecin retiré si le texte le mentionne, sinon null (peu importe qui était là).
 - Si tu hésites entre deux codes, choisis le plus probable et mets "confidence": "low".
 - Si le texte liste PLUSIEURS dates NCT (ex: "2026-09-10 → M"), réponds avec un objet :
   { "commands": [ {…}, {…} ] } où chaque élément suit le format ci-dessus (activity NCT, slot nuit).
@@ -183,6 +200,19 @@ def normalize_raw_command(item: dict, known_doctors: Optional[List[str]] = None)
     out = dict(item)
     command_type = out.get("command_type") or "assignment"
     out["command_type"] = command_type
+
+    if command_type == "removal":
+        # doctor_in toujours null (personne ne prend la place) ; doctor_out
+        # optionnel (qui on retire, si mentionné) - pas besoin de la logique
+        # de récupération doctor_in<->doctor_out des "assignment".
+        out["doctor_in"] = None
+        dout = _norm_doctor_code(out.get("doctor_out"))
+        known = known_doctors or []
+        known_map = {k.upper(): k for k in known}
+        out["doctor_out"] = (dout if dout in known else known_map.get((dout or "").upper(), dout)) if dout else None
+        if not out.get("confidence"):
+            out["confidence"] = "low"
+        return out
 
     if command_type == "room_maintenance":
         # Aucun médecin concerné - ne pas essayer de deviner/récupérer doctor_in.
@@ -382,8 +412,8 @@ def handle_voice_command(req: VoiceCommandRequest) -> VoiceCommandResponse:
         raise HTTPException(status_code=422, detail="Aucune consigne interprétable")
 
     for parsed in commands:
-        if parsed.command_type == "room_maintenance":
-            continue  # aucun médecin concerné, rien à valider ici
+        if parsed.command_type in ("room_maintenance", "removal"):
+            continue  # aucun médecin destinataire requis pour ces types
         if not parsed.doctor_in:
             raise HTTPException(
                 status_code=422,
@@ -421,6 +451,22 @@ def handle_voice_command(req: VoiceCommandRequest) -> VoiceCommandResponse:
             ))
             continue
 
+        if parsed.command_type == "removal":
+            # Vide la case : existing_schedule avec une liste VIDE force tout
+            # le monde à 0 sur ce créneau (personne n'y sera assigné), sans
+            # désigner de remplaçant - le solveur redistribue le reste
+            # normalement autour de ce vide.
+            row_key = resolve_row_key(parsed.slot, parsed.activity)
+            if row_key is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Combinaison créneau/activité non reconnue : {parsed.slot} / {parsed.activity}"
+                )
+            target_date = date.fromisoformat(parsed.date)
+            day_name = DAY_NAMES_FR[target_date.weekday()]
+            existing[f"{row_key}||{day_name}"] = []
+            continue
+
         # command_type == "assignment" (comportement historique inchangé)
         row_key = resolve_row_key(parsed.slot, parsed.activity)
         if row_key is None:
@@ -450,6 +496,12 @@ def handle_voice_command(req: VoiceCommandRequest) -> VoiceCommandResponse:
         elif parsed.command_type == "partial_absence":
             message = (
                 f"{parsed.doctor_in} absent(e) le {parsed.date} ({', '.join(parsed.slots or [parsed.slot])}). "
+                f"Planning recalculé automatiquement."
+            )
+        elif parsed.command_type == "removal":
+            who_txt = f" ({parsed.doctor_out} retiré)" if parsed.doctor_out else ""
+            message = (
+                f"Case vidée le {parsed.date} ({parsed.slot}, {parsed.activity}){who_txt}. "
                 f"Planning recalculé automatiquement."
             )
         else:

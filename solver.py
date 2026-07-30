@@ -591,6 +591,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     hors_site_priority_bonus = []
     full_day_hors_site_vars: List[tuple] = []  # (doc_id, d_idx, var) - appliqué après création de toutes les vars
     non_exclusive_activities: Set[str] = set()  # activités exemptées de "une activité par créneau" (ex: IRM)
+    # Exemptions ciblées (médecin, jour, activité) - contrairement à
+    # non_exclusive_activities (qui exempte TOUT LE MONDE sur cette
+    # activité), ceci ne vaut que pour CE médecin précis ce jour précis (ex:
+    # S peut cumuler ETT ped mercredi avec une garde, mais ça ne change rien
+    # pour un autre médecin qui ferait "Apm - ETT salle 1" un autre jour via
+    # le mécanisme générique). Confirmé utilisateur 29/07/2026.
+    non_exclusive_doctor_day: Set[tuple] = set()
     irm_non_exclusive_pending: List[tuple] = []  # (doc_id, d_idx, slot, var) - exclusion Cs/ETT/Stress différée
 
     for row_key, config in HORS_SITE_CONFIG.items():
@@ -854,6 +861,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         ("A", "MARDI", "am", "Apm - Cs PSS"),
         ("P", "LUNDI", "am", "Apm - Cs PSS"),
     ]
+    # S peut cumuler ETT ped avec une autre tâche (garde, etc.) sur le même
+    # créneau - confirmé utilisateur 29/07/2026. PAS étendu à A/P pour
+    # l'instant (confirmé explicitement : seulement S).
+    NON_EXCLUSIVE_FIXED_DOCTORS = {"S"}
     for doc_id, day_name, slot, row_key in FIXED_CS_ETT_SLOTS:
         if doc_id not in medecins_map:
             continue
@@ -875,6 +886,14 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         for (d2, dd2, sl2, act2), v2 in list(x.items()):
             if dd2 == d_idx and sl2 == slot and act2 == activity_name and d2 != doc_id:
                 model.Add(v2 == 0)
+
+        if doc_id in NON_EXCLUSIVE_FIXED_DOCTORS:
+            # Cumul possible avec garde/astreinte sur ce même créneau
+            # (confirmé utilisateur 29/07/2026) - même mécanisme que IRM :
+            # exempté de "une activité par créneau", SAUF vis-à-vis d'un
+            # autre Cs/ETT/Stress (physiquement impossible en même temps).
+            non_exclusive_activities.add(activity_name)
+            irm_non_exclusive_pending.append((doc_id, d_idx, slot, var))
 
     # --- Doublon Cs (préférence forte, pas absolue - confirmé utilisateur
     # 29/07/2026) : Z lundi après-midi, H mardi après-midi - le même médecin
@@ -1002,6 +1021,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if d2 == doc_id and dd2 == d_idx and sl2 == slot
             and act2.startswith("HIST::")
             and re.match(r"^(Matin|Apm) - (Cs |ETT |Stress$)", act2[len("HIST::"):])
+            and v is not irm_var  # évite l'auto-exclusion si le créneau non-exclusif est lui-même Cs/ETT/Stress (ex: ETT ped de S)
         ]
         for cev in cs_ett_stress_vars_same_slot:
             model.Add(cev == 0).OnlyEnforceIf(irm_var)

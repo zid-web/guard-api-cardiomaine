@@ -561,11 +561,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         # ce weekend (dimanche pour l'ancre astreinte, samedi pour l'ancre
         # garde) - forcé plus loin, section 9.
         if activity == "GARDE" and d_idx in (5, 6):
-            if req.weekend_astreinte_combo and doc_id in (
+            is_combo_anchor = req.weekend_astreinte_combo and doc_id in (
                 req.weekend_combo_astreinte_anchor, req.weekend_combo_garde_anchor
-            ):
-                pass  # autorisé, forcé précisément plus loin
-            else:
+            )
+            garde_row = {"matin": "Garde Matin", "am": "Garde Midi", "nuit": "Garde Nuit"}.get(slot)
+            is_manual_entry = (
+                garde_row is not None
+                and doc_id in (req.existing_schedule or {}).get(f"{garde_row}||{DAY_NAMES_FR[d_idx]}", [])
+            )
+            if not (is_combo_anchor or is_manual_entry):
                 return
 
         statut = medecins_map[doc_id].statut
@@ -1480,11 +1484,21 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if slot is None or activity is None:
                 continue
             day_idx = DAY_NAMES_FR.index(day_name)
-            # Forcer les médecins présents à 1
+            # Forcer les médecins présents à 1 - le solveur ne doit JAMAIS
+            # modifier une saisie manuelle (confirmé utilisateur 30/07/2026).
+            # Si une case saisie manuellement entre en conflit avec une règle
+            # dure (ex: exclusion garde de nuit), le forçage échoue - il FAUT
+            # le signaler explicitement plutôt que de laisser la case
+            # redevenir silencieusement vide.
             for doc in doctors:
                 var = x.get((doc, day_idx, slot, activity))
                 if var is not None:
                     model.Add(var == 1)
+                else:
+                    warnings.append(
+                        f"⚠️ Saisie manuelle non honorée : {doc} sur {row_key} ({day_name}) "
+                        f"entre en conflit avec une règle du solveur - vérifiez cette case."
+                    )
             # Forcer les autres à 0
             for doc in medecins_map:
                 if doc not in doctors:

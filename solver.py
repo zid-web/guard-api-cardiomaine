@@ -168,6 +168,17 @@ ACTIVITIES = ["ASTREINTE", "GARDE", "CORO", "NCT", "REEDUC", "PRE_OP", "RYTHMO"]
 # ne sont plus codés en dur ici : ils sont chargés depuis rules_config.json (+ surcharge
 # optionnelle envoyée par le front dans req.rules_override). Voir config.py.
 
+# Infirmières (Val, Véro, Laura) - binôme obligatoire avec un médecin sur
+# Stress/EE (confirmé utilisateur 31/07/2026, même pools que côté front
+# lib/nurse-rules.ts). Le solveur ne gère PAS le placement de l'infirmière
+# elle-même (positionnée par le front via existing_schedule) - seulement la
+# proposition du médecin partenaire pour les cases où elle est déjà présente.
+NURSES = {"Val", "Véro", "Laura"}
+STRESS_PARTNER_POOL = ["Z", "B", "D", "H", "G", "S", "K"]
+EE_PARTNER_POOL = ["Z", "B", "D", "K", "R", "O", "P", "U", "A", "M", "W", "V", "H", "S", "G"]
+STRESS_ROWS = {"Matin - Stress", "Apm - Stress"}
+EE_ROWS = {"Matin - EE1", "Apm - EE1", "Matin - EE2", "Apm - EE2"}
+
 # Séquences autorisées pour M/O/W (matin, am, nuit)
 ALLOWED_SEQUENCES = [
     (0, 0, 0),
@@ -999,6 +1010,46 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             non_exclusive_activities.add(activity_name)
             irm_non_exclusive_pending.append((doc_id, d_idx, slot, var))
 
+    # --- Binôme infirmière/médecin sur Stress/EE (confirmé utilisateur
+    # 31/07/2026) : le front positionne l'infirmière (Val/Véro/Laura) via
+    # existing_schedule ; le solveur propose ici le médecin partenaire du
+    # pool correspondant, pour chaque case où une infirmière est déjà
+    # présente. Bonus fort (pas une obligation dure) pour rester robuste si
+    # personne du pool n'est disponible ce jour-là.
+    for row_key in STRESS_ROWS | EE_ROWS:
+        slot = "matin" if row_key.startswith("Matin") else "am"
+        pool = STRESS_PARTNER_POOL if row_key in STRESS_ROWS else EE_PARTNER_POOL
+        for day_name in DAY_NAMES_FR[:5]:
+            existing_here = (req.existing_schedule or {}).get(f"{row_key}||{day_name}", [])
+            if not any(n in existing_here for n in NURSES):
+                continue  # pas d'infirmière ici, rien à proposer
+            if any(d for d in existing_here if d not in NURSES):
+                continue  # un partenaire est déjà saisi manuellement, ne pas y toucher
+            d_idx = DAY_NAMES_FR.index(day_name)
+            activity_name = f"HIST::{row_key}"
+            partner_vars = []
+            for doc_id in pool:
+                if doc_id not in medecins_map:
+                    continue
+                if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
+                    continue
+                var = x.get((doc_id, d_idx, slot, activity_name))
+                if var is None:
+                    var = model.NewBoolVar(f"nurse_partner_{doc_id}_{d_idx}_{row_key}")
+                    x[(doc_id, d_idx, slot, activity_name)] = var
+                partner_vars.append(var)
+            if partner_vars:
+                model.Add(sum(partner_vars) <= 1)
+                has_partner = model.NewBoolVar(f"has_partner_{d_idx}_{row_key}")
+                model.Add(sum(partner_vars) >= 1).OnlyEnforceIf(has_partner)
+                model.Add(sum(partner_vars) == 0).OnlyEnforceIf(has_partner.Not())
+                hors_site_priority_bonus.append(40 * has_partner)
+            else:
+                warnings.append(
+                    f"{row_key} ({day_name}) : aucun médecin du pool partenaire disponible "
+                    f"pour accompagner l'infirmière - créneau incomplet cette semaine."
+                )
+
     # --- Doublon Cs (préférence forte, pas absolue - confirmé utilisateur
     # 29/07/2026) : Z lundi après-midi, H mardi après-midi - le même médecin
     # sur 2 salles/sessions simultanées, affiché "Z²"/"H²" côté front (déjà
@@ -1268,6 +1319,31 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         else:
                             model.Add(var == 0)
 
+    # --- 4ter. Couverture quotidienne obligatoire Coro matin/am (lundi-
+    # vendredi) - confirmé utilisateur 31/07/2026 : contrairement à la nuit
+    # (structurée ci-dessus), le jour n'avait AUCUNE obligation de couverture
+    # - seulement une incitation d'équité, qui pouvait laisser un créneau
+    # totalement vide même quand M/O/W étaient tous disponibles (bug
+    # constaté S35). Compatible avec les forçages déjà en place plus loin
+    # (mercredi après-midi, vendredi) qui satisfont déjà "exactement 1".
+    for d_idx in range(5):
+        for slot in ("matin", "am"):
+            coro_allowed_vars = [
+                var for (doc, d, sl, act), var in x.items()
+                if d == d_idx and sl == slot and act == "CORO" and doc in CORO_ALLOWED
+            ]
+            if coro_allowed_vars:
+                has_coverage = model.NewBoolVar(f"coro_daily_coverage_{d_idx}_{slot}")
+                model.Add(sum(coro_allowed_vars) >= 1).OnlyEnforceIf(has_coverage)
+                model.Add(sum(coro_allowed_vars) == 0).OnlyEnforceIf(has_coverage.Not())
+                model.Add(sum(coro_allowed_vars) <= 1)
+                hors_site_priority_bonus.append(40 * has_coverage)
+            else:
+                warnings.append(
+                    f"Coro {DAY_NAMES_FR[d_idx]} {slot} : aucun médecin disponible - "
+                    f"créneau non couvert cette semaine."
+                )
+
     # --- 4bis. M/O/W ne peuvent jamais faire 2 astreintes de nuit la même
     # semaine en semaine (lundi-vendredi) - confirmé utilisateur 27/07/2026 :
     # "jamais 2 fois le même médecin", total sur la semaine (pas seulement
@@ -1324,14 +1400,34 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         else:
             warnings.append("JEUDI : aucun médecin disponible pour la NCT (vacances ou exclu)")
 
-        # Alternance NCT : ne pas répéter le même que la semaine précédente
+        # Alternance NCT : ne pas répéter le même que la semaine précédente -
+        # sauf si un seul candidat NCT reste disponible cette semaine (l'autre
+        # étant absent), auquel cas la répétition est inévitable (confirmé
+        # utilisateur 31/07/2026, même principe que l'assouplissement
+        # astreinte hebdomadaire ci-dessus).
+        _nct_available_this_week = [
+            doc for doc in nct_pool if x.get((doc, 3, "nuit", "NCT")) is not None
+        ]
         if req.last_nct_doctor and req.last_nct_doctor in nct_pool:
-            var_nct = x.get((req.last_nct_doctor, 3, "nuit", "NCT"))
-            if var_nct is not None:
-                model.Add(var_nct == 0)
+            if len(_nct_available_this_week) == 1 and _nct_available_this_week[0] == req.last_nct_doctor:
+                warnings.append(
+                    f"⚠️ Seul {req.last_nct_doctor} est disponible pour la NCT cette semaine "
+                    f"(l'autre est absent) - alternance non respectée exceptionnellement, "
+                    f"répétition inévitable."
+                )
+            else:
+                var_nct = x.get((req.last_nct_doctor, 3, "nuit", "NCT"))
+                if var_nct is not None:
+                    model.Add(var_nct == 0)
 
-        # NCT interdit si astreinte nuit la veille (mercredi)
+        # NCT interdit si astreinte nuit la veille (mercredi) - sauf si un
+        # seul candidat NCT reste disponible cette semaine (confirmé
+        # utilisateur 31/07/2026, même assouplissement que ci-dessus : ce
+        # médecin peut alors être structurellement nécessaire à la fois pour
+        # l'astreinte du mercredi et la NCT du jeudi, faute d'alternative).
         for doc in nct_pool:
+            if len(_nct_available_this_week) == 1 and _nct_available_this_week[0] == doc:
+                continue
             var_nct = x.get((doc, 3, "nuit", "NCT"))
             var_astreinte_mercredi = x.get((doc, 2, "nuit", "ASTREINTE"))
             if var_nct is not None and var_astreinte_mercredi is not None:

@@ -1273,13 +1273,32 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # "jamais 2 fois le même médecin", total sur la semaine (pas seulement
     # consécutif). Le weekend (samedi/dimanche) est explicitement exempté de
     # cette règle - un même médecin WOM peut y être présent sans que ça compte.
-    for doc in wom_pool:
-        weekday_night_vars = [
+    #
+    # Assouplissement automatique (confirmé utilisateur 31/07/2026) : si un
+    # seul membre du pool WOM est disponible cette semaine (les 2 autres
+    # totalement absents), la règle est impossible à respecter (il faut
+    # couvrir plusieurs nuits WOM avec une seule personne) - on la relâche
+    # UNIQUEMENT pour ce médecin-là, avec un avertissement explicite.
+    _wom_weekday_vars_by_doc = {
+        doc: [
             v for (d_op, d, sl, act), v in x.items()
             if d_op == doc and d < 5 and sl == "nuit" and act == "ASTREINTE"
         ]
-        if weekday_night_vars:
-            model.Add(sum(weekday_night_vars) <= 1)
+        for doc in wom_pool
+    }
+    _wom_available_this_week = [doc for doc, vs in _wom_weekday_vars_by_doc.items() if vs]
+    for doc in wom_pool:
+        weekday_night_vars = _wom_weekday_vars_by_doc[doc]
+        if not weekday_night_vars:
+            continue
+        if len(_wom_available_this_week) == 1:
+            warnings.append(
+                f"⚠️ Seul {doc} est disponible cette semaine parmi les coronarographistes "
+                f"(les autres sont absents) - règle \"jamais 2 astreintes de nuit/semaine\" "
+                f"assouplie exceptionnellement pour lui, plusieurs nuits possibles."
+            )
+            continue
+        model.Add(sum(weekday_night_vars) <= 1)
 
     # --- 5. NCT (jeudi nuit) ---
     thursday_iso = days[3].isoformat()

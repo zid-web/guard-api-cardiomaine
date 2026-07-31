@@ -816,6 +816,80 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if winner != req.pssl_doctor:
                     warnings.append(f"PSSL : {req.pssl_doctor} indisponible ce jeudi, repli sur {winner}.")
 
+    # --- Coro mercredi après-midi : O par défaut, repli libre M/W si absent
+    # (confirmé utilisateur 31/07/2026 : "O fait tout le temps la coro
+    # mercredi AM sauf vacances", pas de priorité entre M/W au repli - le
+    # solveur choisit librement). Créé directement (comme FIXED_CS_ETT_SLOTS)
+    # pour être robuste même sans historical_patterns.
+    mercredi_idx = DAY_NAMES_FR.index("MERCREDI")
+    if "O" in medecins_map and not (
+        is_on_vacation("O", days[mercredi_idx], req.vacations) or is_on_vacation("O", days[mercredi_idx], req.congres)
+    ):
+        var_o = x.get(("O", mercredi_idx, "am", "CORO"))
+        if var_o is None:
+            var_o = model.NewBoolVar(f"coro_mercredi_o_{mercredi_idx}")
+            x[("O", mercredi_idx, "am", "CORO")] = var_o
+        model.Add(var_o == 1)
+        for other in ("M", "W"):
+            v_other = x.get((other, mercredi_idx, "am", "CORO"))
+            if v_other is not None:
+                model.Add(v_other == 0)
+    else:
+        warnings.append("Coro mercredi après-midi : O en congé - repli libre entre M et W.")
+        for other in ("M", "W"):
+            if other not in medecins_map:
+                continue
+            if is_on_vacation(other, days[mercredi_idx], req.vacations) or is_on_vacation(other, days[mercredi_idx], req.congres):
+                continue
+            v_other = x.get((other, mercredi_idx, "am", "CORO"))
+            if v_other is None:
+                # M/W sont normalement en demi-journée fixe libre mercredi
+                # après-midi - exception explicite pour ce repli (confirmé
+                # utilisateur 31/07/2026 : l'un d'eux doit pouvoir couvrir
+                # Coro quand O est absent, malgré leur 1/2 off habituelle).
+                v_other = model.NewBoolVar(f"coro_mercredi_repli_{other}")
+                x[(other, mercredi_idx, "am", "CORO")] = v_other
+            hors_site_priority_bonus.append(50 * v_other)
+
+    # --- Coro vendredi (matin + après-midi) : alternance M/W selon parité de
+    # semaine (confirmé utilisateur 31/07/2026, O jamais candidat ce jour) :
+    # semaine impaire -> W matin ET après-midi ; semaine paire -> M matin, W
+    # après-midi. Repli sur l'autre du couple M/W si le titulaire du jour est
+    # indisponible (même principe que LFB/PSSL).
+    vendredi_idx = DAY_NAMES_FR.index("VENDREDI")
+    if req.week_type == 1:
+        vendredi_coro_slots = [("matin", "W"), ("am", "M")]
+    else:
+        vendredi_coro_slots = [("matin", "M"), ("am", "W")]
+    for slot, preferred in vendredi_coro_slots:
+        candidates = [preferred] + [d for d in ("M", "W") if d != preferred]
+        winner = None
+        for doc in candidates:
+            if doc not in medecins_map:
+                continue
+            if is_on_vacation(doc, days[vendredi_idx], req.vacations) or is_on_vacation(doc, days[vendredi_idx], req.congres):
+                continue
+            winner = doc
+            break
+        if winner is None:
+            warnings.append(f"Coro vendredi {slot} : ni M ni W disponible - créneau non couvert cette semaine.")
+            continue
+        var_winner = x.get((winner, vendredi_idx, slot, "CORO"))
+        if var_winner is None:
+            var_winner = model.NewBoolVar(f"coro_vendredi_{winner}_{slot}")
+            x[(winner, vendredi_idx, slot, "CORO")] = var_winner
+        model.Add(var_winner == 1)
+        for other in ("M", "W"):
+            if other == winner:
+                continue
+            v_other = x.get((other, vendredi_idx, slot, "CORO"))
+            if v_other is not None:
+                model.Add(v_other == 0)
+        # O jamais candidat sur Coro vendredi (confirmé utilisateur)
+        v_o = x.get(("O", vendredi_idx, slot, "CORO"))
+        if v_o is not None:
+            model.Add(v_o == 0)
+
     historical_vars: Dict[tuple, Any] = {}  # (row_key, d_idx) -> {doc_id: (BoolVar, frequency)}
     historical_patterns = req.historical_patterns or {}
 
@@ -1828,6 +1902,47 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if freq > 0
     ]
     historical_bonus = sum(historical_bonus_terms) if historical_bonus_terms else 0
+
+    # --- Préférences souples ATL/Coro M/O/W (confirmé utilisateur 31/07/2026) ---
+    jeudi_idx = DAY_NAMES_FR.index("JEUDI")
+
+    # 1) Jeudi : celui de W/M qui NE fait PAS NCT fait la coro du matin (et
+    # vice versa) - bonus pour le "complément", pas une obligation (O reste
+    # candidat normal sur ce créneau par ailleurs).
+    w_nct = x.get(("W", jeudi_idx, "nuit", "NCT"))
+    m_nct = x.get(("M", jeudi_idx, "nuit", "NCT"))
+    w_coro_matin_jeu = x.get(("W", jeudi_idx, "matin", "CORO"))
+    m_coro_matin_jeu = x.get(("M", jeudi_idx, "matin", "CORO"))
+    if w_nct is not None and m_coro_matin_jeu is not None:
+        match1 = model.NewBoolVar("nct_coro_complement_w_m")
+        model.AddBoolAnd([w_nct, m_coro_matin_jeu]).OnlyEnforceIf(match1)
+        model.AddBoolOr([w_nct.Not(), m_coro_matin_jeu.Not()]).OnlyEnforceIf(match1.Not())
+        hors_site_priority_bonus.append(20 * match1)
+    if m_nct is not None and w_coro_matin_jeu is not None:
+        match2 = model.NewBoolVar("nct_coro_complement_m_w")
+        model.AddBoolAnd([m_nct, w_coro_matin_jeu]).OnlyEnforceIf(match2)
+        model.AddBoolOr([m_nct.Not(), w_coro_matin_jeu.Not()]).OnlyEnforceIf(match2.Not())
+        hors_site_priority_bonus.append(20 * match2)
+
+    # 2) O souvent garde matin/midi/nuit le jeudi - option à privilégier dans
+    # la mesure de l'équité globale, pas systématique (bonus léger).
+    for slot in ("matin", "am", "nuit"):
+        v_o_garde_jeu = x.get(("O", jeudi_idx, slot, "GARDE"))
+        if v_o_garde_jeu is not None:
+            hors_site_priority_bonus.append(5 * v_o_garde_jeu)
+
+    # 3) Éviter de mettre W en coro le lendemain matin d'une astreinte de
+    # nuit, quand M/O/W sont tous les 3 présents - préférence souple
+    # (pénalité), pas une exclusion dure.
+    for d_idx in range(6):
+        w_astreinte_nuit = x.get(("W", d_idx, "nuit", "ASTREINTE"))
+        w_coro_matin_next = x.get(("W", d_idx + 1, "matin", "CORO"))
+        if w_astreinte_nuit is not None and w_coro_matin_next is not None:
+            penalty = model.NewBoolVar(f"w_coro_after_astreinte_nuit_{d_idx}")
+            model.AddBoolAnd([w_astreinte_nuit, w_coro_matin_next]).OnlyEnforceIf(penalty)
+            model.AddBoolOr([w_astreinte_nuit.Not(), w_coro_matin_next.Not()]).OnlyEnforceIf(penalty.Not())
+            hors_site_priority_bonus.append(-15 * penalty)
+
     hors_site_bonus = sum(hors_site_priority_bonus) if hors_site_priority_bonus else 0
     reeduc_bonus = sum(reeduc_priority_bonus) if reeduc_priority_bonus else 0
 

@@ -1324,9 +1324,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 model.Add(sum(am_vars) == 0).OnlyEnforceIf(presence_am.Not())
                 model.AddImplication(var_nuit_garde, presence_am.Not())
 
-    # 7.3 Pas d'astreinte nuit si garde ce jour
+    # 7.3 Pas d'astreinte nuit si garde ce jour (LUNDI-VENDREDI uniquement -
+    # le weekend est couvert par la règle 9bis, plus bas, qui respecte les
+    # saisies manuelles existantes ; cette règle-ci n'avait pas cette
+    # exception et entrait en conflit avec elles, confirmé bug 30/07/2026).
     for doc_id in medecins_map:
-        for d_idx in range(7):
+        for d_idx in range(5):
             garde_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and doc == doc_id and act == "GARDE"]
             if not garde_vars:
                 continue
@@ -1337,9 +1340,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if nuit_astreinte is not None:
                 model.AddImplication(garde_present, nuit_astreinte.Not())
 
-    # --- 8. Séquences valides pour M, O, W ---
+    # --- 8. Séquences valides pour M, O, W (LUNDI-VENDREDI uniquement - le
+    # weekend est couvert par la règle 9bis, plus bas, qui respecte les
+    # saisies manuelles existantes ; cette contrainte-ci n'avait pas cette
+    # exception et entrait en conflit avec elles, confirmé bug 30/07/2026).
     for doc_id in astreinte_coro_ids:
-        for d_idx in range(7):
+        for d_idx in range(5):
             m_type = model.NewIntVar(0, 2, f"seq_m_{doc_id}_{d_idx}")
             a_type = model.NewIntVar(0, 2, f"seq_a_{doc_id}_{d_idx}")
             n_type = model.NewIntVar(0, 2, f"seq_n_{doc_id}_{d_idx}")
@@ -1515,6 +1521,51 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if v_ven is not None and v_sam is not None:
                     model.Add(v_ven == v_sam)
 
+    # --- 9bis. Règle absolue : jamais astreinte ET garde le même jour de
+    # weekend pour un même médecin (confirmé utilisateur 30/07/2026) -
+    # filet de sécurité indépendant du mécanisme (combo, non-combo) qui
+    # aurait pu produire la situation. N'entre PAS en conflit avec une
+    # saisie manuelle déjà en place pour ce jour précis (priorité absolue
+    # des saisies manuelles, confirmée séparément) - dans ce cas, seul un
+    # avertissement est émis plutôt qu'un blocage complet de la génération.
+    astreinte_garde_rows = {"matin": "Astreintes ATL Matin", "am": "Astreintes ATL Midi", "nuit": "Astreintes ATL Nuit"}
+    garde_rows_by_slot = {"matin": "Garde Matin", "am": "Garde Midi", "nuit": "Garde Nuit"}
+    for doc_id in medecins_map:
+        for d_idx in (5, 6):
+            day_nm = DAY_NAMES_FR[d_idx]
+            manual_astreinte = any(
+                doc_id in (req.existing_schedule or {}).get(f"{r}||{day_nm}", [])
+                for r in astreinte_garde_rows.values()
+            )
+            manual_garde = any(
+                doc_id in (req.existing_schedule or {}).get(f"{r}||{day_nm}", [])
+                for r in garde_rows_by_slot.values()
+            )
+            if manual_astreinte and manual_garde:
+                warnings.append(
+                    f"⚠️ {doc_id} a ASTREINTE et GARDE saisis manuellement le même jour "
+                    f"({day_nm}) - normalement jamais cumulé, vérifiez cette saisie."
+                )
+                continue  # priorité à la saisie manuelle, pas de contrainte dure ici
+
+            astreinte_vars = [
+                v for (doc, d, sl, act), v in x.items()
+                if doc == doc_id and d == d_idx and act == "ASTREINTE"
+            ]
+            garde_vars = [
+                v for (doc, d, sl, act), v in x.items()
+                if doc == doc_id and d == d_idx and act == "GARDE"
+            ]
+            if not astreinte_vars or not garde_vars:
+                continue
+            has_astreinte = model.NewBoolVar(f"has_astreinte_{doc_id}_{d_idx}")
+            has_garde = model.NewBoolVar(f"has_garde_{doc_id}_{d_idx}")
+            model.Add(sum(astreinte_vars) >= 1).OnlyEnforceIf(has_astreinte)
+            model.Add(sum(astreinte_vars) == 0).OnlyEnforceIf(has_astreinte.Not())
+            model.Add(sum(garde_vars) >= 1).OnlyEnforceIf(has_garde)
+            model.Add(sum(garde_vars) == 0).OnlyEnforceIf(has_garde.Not())
+            model.Add(has_astreinte + has_garde <= 1)
+
     # --- 10. Préservation des saisies manuelles ---
     if req.existing_schedule:
         for combined_key, doctors in req.existing_schedule.items():
@@ -1557,8 +1608,34 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     model.Add(v_astreinte == v_coro)
 
     # --- 10bis. Couplages weekend (confirmé utilisateur 28/07/2026) ---
+    # Tous ces couplages (par défaut, utile quand rien n'est saisi) N'ENTRENT
+    # PLUS en conflit avec une saisie manuelle existante (confirmé bug
+    # 30/07/2026, cf. règle 9bis) : si le médecin a déjà une saisie manuelle
+    # sur AU MOINS une des 2 cases couplées ce jour-là, on ne force pas le
+    # couplage pour lui - la saisie manuelle prime toujours.
+    def _has_manual_entry(doc: str, row: str, day_nm: str) -> bool:
+        return doc in (req.existing_schedule or {}).get(f"{row}||{day_nm}", [])
+
+    ASTREINTE_ROW_BY_SLOT = {"matin": "Astreintes ATL Matin", "am": "Astreintes ATL Midi", "nuit": "Astreintes ATL Nuit"}
+    GARDE_ROW_BY_SLOT = {"matin": "Garde Matin", "am": "Garde Midi", "nuit": "Garde Nuit"}
+
     # ATL Sam/Dim : Matin = Midi = Nuit (un seul médecin par jour)
     for d_idx in (5, 6):
+        day_nm = DAY_NAMES_FR[d_idx]
+        # Si N'IMPORTE QUEL médecin a une saisie manuelle sur l'un des 3
+        # créneaux ASTREINTE ce jour-là, la journée n'est plus "propre" (un
+        # seul médecin ne peut plus couvrir tout seul) - on désactive le
+        # couplage automatique pour TOUT LE MONDE ce jour-là, pas seulement
+        # pour le médecin concerné, sinon un autre WOM reste bloqué à devoir
+        # couvrir toute la journée pour compenser un seul créneau déjà pris
+        # (confirmé bug réel le 30/07/2026, cas W garde matin + astreinte nuit).
+        day_has_any_manual_astreinte = any(
+            _has_manual_entry(doc, r, day_nm)
+            for doc in medecins_map
+            for r in ASTREINTE_ROW_BY_SLOT.values()
+        )
+        if day_has_any_manual_astreinte:
+            continue
         for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
             for doc in medecins_map:
                 va = x.get((doc, d_idx, slot_a, "ASTREINTE"))
@@ -1567,23 +1644,33 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     model.Add(va == vb)
 
     # Garde Samedi : Midi = Nuit (un seul médecin)
-    for doc in medecins_map:
-        va = x.get((doc, 5, "am", "GARDE"))
-        vb = x.get((doc, 5, "nuit", "GARDE"))
-        if va is not None and vb is not None:
-            model.Add(va == vb)
-
-    # Garde Dimanche : Matin = Midi = Nuit (un seul médecin)
-    for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
+    samedi_has_any_manual_garde = any(
+        _has_manual_entry(doc, r, "SAMEDI") for doc in medecins_map for r in GARDE_ROW_BY_SLOT.values()
+    )
+    if not samedi_has_any_manual_garde:
         for doc in medecins_map:
-            va = x.get((doc, 6, slot_a, "GARDE"))
-            vb = x.get((doc, 6, slot_b, "GARDE"))
+            va = x.get((doc, 5, "am", "GARDE"))
+            vb = x.get((doc, 5, "nuit", "GARDE"))
             if va is not None and vb is not None:
                 model.Add(va == vb)
+
+    # Garde Dimanche : Matin = Midi = Nuit (un seul médecin)
+    dimanche_has_any_manual_garde = any(
+        _has_manual_entry(doc, r, "DIMANCHE") for doc in medecins_map for r in GARDE_ROW_BY_SLOT.values()
+    )
+    if not dimanche_has_any_manual_garde:
+        for slot_a, slot_b in (("matin", "am"), ("am", "nuit")):
+            for doc in medecins_map:
+                va = x.get((doc, 6, slot_a, "GARDE"))
+                vb = x.get((doc, 6, slot_b, "GARDE"))
+                if va is not None and vb is not None:
+                    model.Add(va == vb)
 
     # Garde Samedi Matin = celui qui a fait la garde de nuit vendredi
     # (Sam Midi/Nuit reste un choix séparé, déjà couplé entre eux ci-dessus)
     for doc in medecins_map:
+        if _has_manual_entry(doc, "Garde Matin", "SAMEDI"):
+            continue
         ven_nuit = x.get((doc, 4, "nuit", "GARDE"))
         sam_matin = x.get((doc, 5, "matin", "GARDE"))
         if ven_nuit is not None and sam_matin is not None:

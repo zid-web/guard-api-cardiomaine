@@ -1344,6 +1344,38 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     f"créneau non couvert cette semaine."
                 )
 
+    # --- 4quater. Coro matin ≠ Coro après-midi le même jour, UNIQUEMENT si
+    # les 3 coronarographistes (M, O, W) sont disponibles ce jour-là -
+    # confirmé utilisateur 31/07/2026 : "de préférence 2 médecins par jour
+    # (1 par vacation)... seulement si absence d'un ou des 2 autres" (1 seul
+    # médecin peut alors couvrir les deux créneaux). Lundi-vendredi
+    # uniquement (le weekend n'est pas concerné par cette règle).
+    for d_idx in range(5):
+        wom_present_today = [
+            doc for doc in wom_pool
+            if not is_on_vacation(doc, days[d_idx], req.vacations)
+            and not is_on_vacation(doc, days[d_idx], req.congres)
+        ]
+        if len(wom_present_today) < 3:
+            # Absence(s) : pas de restriction dure, MAIS préférence pour
+            # qu'un seul médecin couvre les deux créneaux ce jour-là
+            # (confirmé utilisateur 31/07/2026), plutôt que 2 personnes
+            # différentes par défaut faute d'incitation contraire.
+            for doc in wom_present_today:
+                matin_var = x.get((doc, d_idx, "matin", "CORO"))
+                am_var = x.get((doc, d_idx, "am", "CORO"))
+                if matin_var is not None and am_var is not None:
+                    same_doc_both_slots = model.NewBoolVar(f"coro_same_doc_{doc}_{d_idx}")
+                    model.AddBoolAnd([matin_var, am_var]).OnlyEnforceIf(same_doc_both_slots)
+                    model.AddBoolOr([matin_var.Not(), am_var.Not()]).OnlyEnforceIf(same_doc_both_slots.Not())
+                    hors_site_priority_bonus.append(25 * same_doc_both_slots)
+            continue
+        for doc in wom_pool:
+            matin_var = x.get((doc, d_idx, "matin", "CORO"))
+            am_var = x.get((doc, d_idx, "am", "CORO"))
+            if matin_var is not None and am_var is not None:
+                model.Add(matin_var + am_var <= 1)
+
     # --- 4bis. M/O/W ne peuvent jamais faire 2 astreintes de nuit la même
     # semaine en semaine (lundi-vendredi) - confirmé utilisateur 27/07/2026 :
     # "jamais 2 fois le même médecin", total sur la semaine (pas seulement

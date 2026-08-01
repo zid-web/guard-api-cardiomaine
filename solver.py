@@ -475,6 +475,23 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if activity == "CORO" and is_room_under_maintenance(day, slot, req.room_maintenance):
             return
 
+        # Astreinte ATL suit automatiquement Coro (couplage confirmé DOC022,
+        # 28/07/2026) - donc pendant une maintenance de la salle de coro,
+        # l'astreinte des médecins coronarographistes doit AUSSI devenir
+        # indisponible sur ce créneau, sinon le couplage ne peut jamais
+        # s'appliquer (la variable Coro n'existe plus, rien à coupler) et
+        # l'astreinte reste assignable à tort (confirmé bug utilisateur
+        # 31/07/2026). Lundi-vendredi, matin/am uniquement - même périmètre
+        # exact que le couplage ATL=Coro.
+        if (
+            activity == "ASTREINTE"
+            and doc_id in CORO_ALLOWED
+            and slot in ("matin", "am")
+            and day.weekday() < 5
+            and is_room_under_maintenance(day, slot, req.room_maintenance)
+        ):
+            return
+
         if doc_id in (daas_id, d_id):
             return
 
@@ -833,7 +850,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # solveur choisit librement). Créé directement (comme FIXED_CS_ETT_SLOTS)
     # pour être robuste même sans historical_patterns.
     mercredi_idx = DAY_NAMES_FR.index("MERCREDI")
-    if "O" in medecins_map and not (
+    mercredi_am_maintenance = is_room_under_maintenance(days[mercredi_idx], "am", req.room_maintenance)
+    if mercredi_am_maintenance:
+        warnings.append("Coro mercredi après-midi : salle en maintenance - créneau non couvert.")
+    elif "O" in medecins_map and not (
         is_on_vacation("O", days[mercredi_idx], req.vacations) or is_on_vacation("O", days[mercredi_idx], req.congres)
     ):
         var_o = x.get(("O", mercredi_idx, "am", "CORO"))
@@ -873,6 +893,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     else:
         vendredi_coro_slots = [("matin", "M"), ("am", "W")]
     for slot, preferred in vendredi_coro_slots:
+        if is_room_under_maintenance(days[vendredi_idx], slot, req.room_maintenance):
+            warnings.append(f"Coro vendredi {slot} : salle en maintenance - créneau non couvert.")
+            continue
         candidates = [preferred] + [d for d in ("M", "W") if d != preferred]
         winner = None
         for doc in candidates:

@@ -1701,6 +1701,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     if v_dim_astr is not None:
                         model.Add(v_dim_astr == is_garde_anchor[doc])
 
+                # Exclure l'ancre astreinte (Vendredi Nuit + WE) des astreintes de nuit de lundi (0) et mardi (1)
+                v_lundi_nuit = x.get((doc, 0, "nuit", "ASTREINTE"))
+                if v_lundi_nuit is not None:
+                    model.Add(v_lundi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
+                
+                v_mardi_nuit = x.get((doc, 1, "nuit", "ASTREINTE"))
+                if v_mardi_nuit is not None:
+                    model.Add(v_mardi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
+
             if is_astreinte_anchor:
                 model.Add(sum(is_astreinte_anchor.values()) == 1)
             else:

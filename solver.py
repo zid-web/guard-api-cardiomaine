@@ -2147,6 +2147,20 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     cs_spread = _spread(cs_points, "cs")
     ett_spread = _spread(ett_points, "ett")
 
+    garde_24h_bonuses = []
+    for d_idx in range(1, 7): # Mardi à Dimanche
+        for doc in req.medecins:
+            doc_id = doc.id
+            v_matin = x.get((doc_id, d_idx, "matin", "GARDE"))
+            v_am = x.get((doc_id, d_idx, "am", "GARDE"))
+            v_nuit = x.get((doc_id, d_idx, "nuit", "GARDE"))
+            if v_matin is not None and v_am is not None and v_nuit is not None:
+                is_garde_24h = model.NewBoolVar(f"is_garde_24h_{doc_id}_{d_idx}")
+                model.AddMinEquality(is_garde_24h, [v_matin, v_am, v_nuit])
+                garde_24h_bonuses.append(is_garde_24h)
+
+    garde_24h_bonus = sum(garde_24h_bonuses) if garde_24h_bonuses else 0
+
     # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
     # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
     # ASTREINTE du groupe 3 (poids plus léger, 3 personnes chacune), l'équité
@@ -2160,7 +2174,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + stress_quota_penalty
-        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
+        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus - (garde_24h_bonus * 10)
     )
 
 

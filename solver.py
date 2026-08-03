@@ -1702,13 +1702,16 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         model.Add(v_dim_astr == is_garde_anchor[doc])
 
                 # Exclure l'ancre astreinte (Vendredi Nuit + WE) des astreintes de nuit de lundi (0) et mardi (1)
-                v_lundi_nuit = x.get((doc, 0, "nuit", "ASTREINTE"))
-                if v_lundi_nuit is not None:
-                    model.Add(v_lundi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
-                
-                v_mardi_nuit = x.get((doc, 1, "nuit", "ASTREINTE"))
-                if v_mardi_nuit is not None:
-                    model.Add(v_mardi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
+                # UNIQUE CONDITION : valable uniquement si M, O, W sont TOUS LES 3 PRÉSENTS pendant la semaine
+                all_mow_present = all(not any(is_on_vacation(m_doc, d, req.vacations) for d in jours_semaine(week_start)) for m_doc in ["M", "O", "W"])
+                if all_mow_present:
+                    v_lundi_nuit = x.get((doc, 0, "nuit", "ASTREINTE"))
+                    if v_lundi_nuit is not None:
+                        model.Add(v_lundi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
+                    
+                    v_mardi_nuit = x.get((doc, 1, "nuit", "ASTREINTE"))
+                    if v_mardi_nuit is not None:
+                        model.Add(v_mardi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
 
             if is_astreinte_anchor:
                 model.Add(sum(is_astreinte_anchor.values()) == 1)

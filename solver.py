@@ -1295,17 +1295,42 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     for v in other_vars_next_day:
                         model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
 
-                # Interdiction stricte Coro / Astreinte ATL / Rythmo le lendemain d'une GARDE de nuit
-                coro_rythmo_next_day_vars = [
-                    v for (doc, d, sl, act), v in x.items()
-                    if doc == doc_id and d == d_idx + 1 and (
-                        act in ("CORO", "ASTREINTE", "RYTHMO") or
-                        act.startswith("HIST::Matin - Coro") or
-                        act.startswith("HIST::Apm - Coro") or
-                        act.startswith("HIST::Matin - Rythmo") or
-                        act.startswith("HIST::Apm - Rythmo")
+                # Interdiction Coro / Astreinte ATL / Rythmo le lendemain d'une GARDE de nuit.
+                # RÈGLE SPÉCIALE M, O, W : Ne s'applique QUE SI les 3 (M, O, W) sont présents aujourd'hui (d) et demain (d+1).
+                # Si 1 ou 2 d'entre eux est absent/en congés, la règle tombe automatiquement et l'enchaînement est autorisé.
+                mow_all_present_today_and_next = (
+                    d_idx < 6 and all(
+                        not is_on_vacation(m_code, days[d_idx], req.vacations) and
+                        not is_on_vacation(m_code, days[d_idx + 1], req.vacations) and
+                        not (m_code in fixed_exclusions and d_idx in fixed_exclusions[m_code]) and
+                        not (m_code in fixed_exclusions and (d_idx + 1) in fixed_exclusions[m_code])
+                        for m_code in ("M", "O", "W")
                     )
-                ]
+                )
+
+                coro_rythmo_next_day_vars = []
+                for (doc, d, sl, act), v in x.items():
+                    if doc == doc_id and d == d_idx + 1:
+                        is_coro_atl = (
+                            act in ("CORO", "ASTREINTE") or
+                            act.startswith("HIST::Matin - Coro") or
+                            act.startswith("HIST::Apm - Coro")
+                        )
+                        is_rythmo = (
+                            act == "RYTHMO" or
+                            act.startswith("HIST::Matin - Rythmo") or
+                            act.startswith("HIST::Apm - Rythmo")
+                        )
+
+                        if is_rythmo:
+                            coro_rythmo_next_day_vars.append(v)
+                        elif is_coro_atl:
+                            if doc_id in ("M", "O", "W"):
+                                if mow_all_present_today_and_next:
+                                    coro_rythmo_next_day_vars.append(v)
+                            else:
+                                coro_rythmo_next_day_vars.append(v)
+
                 for v in coro_rythmo_next_day_vars:
                     model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
 

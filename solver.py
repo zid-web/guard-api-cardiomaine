@@ -1356,23 +1356,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     model.AddBoolAnd([worked_night_ast, v]).OnlyEnforceIf(penalty_var)
                     model.AddBoolOr([worked_night_ast.Not(), v.Not()]).OnlyEnforceIf(penalty_var.Not())
                     astreinte_nuit_coro_matin_penalties.append(10 * penalty_var)
-            # Interdiction stricte Coro / Astreinte ATL / Rythmo le lendemain d'une GARDE de nuit.
-            # Si le médecin est le seul disponible/éligible pour la Coro ou le Rythmo le lendemain,
-            # cette contrainte interdira à ce médecin de faire la garde de nuit la veille,
-            # forçant le solveur à choisir UN AUTRE MÉDECIN pour la garde de nuit.
-            if night_garde_vars:
-                coro_rythmo_next_day_vars = [
-                    v for (doc, d, sl, act), v in x.items()
-                    if doc == doc_id and d == d_idx + 1 and (
-                        act in ("CORO", "ASTREINTE", "RYTHMO") or
-                        act.startswith("HIST::Matin - Coro") or
-                        act.startswith("HIST::Apm - Coro") or
-                        act.startswith("HIST::Matin - Rythmo") or
-                        act.startswith("HIST::Apm - Rythmo")
-                    )
-                ]
-                for v in coro_rythmo_next_day_vars:
-                    model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
+
+    astreinte_nuit_coro_matin_penalty = sum(astreinte_nuit_coro_matin_penalties) if astreinte_nuit_coro_matin_penalties else 0
 
     # Cas dimanche (semaine précédente) -> lundi (cette semaine) : le doctor est connu
     # à l'avance (transmis par le front), donc traité comme une exclusion fixe

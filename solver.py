@@ -2281,6 +2281,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     # --- 10bis. Interne (I) toujours assigné à la Garde Matin (Lundi au Vendredi) ---
     # en association avec le médecin senior de Garde AM du même jour.
+    garde_continuity_bonuses = []
     for d_idx in range(5):
         i_vac = is_on_vacation("I", days[d_idx], req.vacations) or is_on_vacation("I", days[d_idx], req.congres)
         if not i_vac:
@@ -2338,7 +2339,6 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     mwo_target_penalty = sum(mwo_target_terms) if mwo_target_terms else 0
 
     # --- Continuité des gardes (24h / même médecin) & Priorité la veille des 1/2 off AM ---
-    garde_continuity_bonuses = []
     garde_eve_off_bonuses = []
 
     for d_idx, day_nm in enumerate(DAY_NAMES_FR):

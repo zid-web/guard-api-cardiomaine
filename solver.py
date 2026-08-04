@@ -2197,31 +2197,57 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 mwo_target_terms.append(dev * 10)
     mwo_target_penalty = sum(mwo_target_terms) if mwo_target_terms else 0
 
-    garde_24h_bonuses = []
-    for d_idx in range(1, 7): # Mardi à Dimanche
-        for doc in req.medecins:
-            doc_id = doc.id
+    # --- Continuité des gardes (24h / même médecin) & Priorité la veille des 1/2 off AM ---
+    garde_continuity_bonuses = []
+    garde_eve_off_bonuses = []
+
+    for d_idx, day_nm in enumerate(DAY_NAMES_FR):
+        next_d_idx = d_idx + 1
+        next_day_nm = DAY_NAMES_FR[next_d_idx] if next_d_idx < 7 else None
+
+        # Médecins ayant leur 1/2 journée off l'après-midi du lendemain
+        off_next_apm_docs = half_days_off.get((next_day_nm, "am"), set()) if next_day_nm else set()
+
+        for doc_id in GARDE_EQUITY_IDS:
             v_matin = x.get((doc_id, d_idx, "matin", "GARDE"))
             v_am = x.get((doc_id, d_idx, "am", "GARDE"))
             v_nuit = x.get((doc_id, d_idx, "nuit", "GARDE"))
-            if v_matin is not None and v_am is not None and v_nuit is not None:
-                is_garde_24h = model.NewBoolVar(f"is_garde_24h_{doc_id}_{d_idx}")
-                model.AddMinEquality(is_garde_24h, [v_matin, v_am, v_nuit])
-                garde_24h_bonuses.append(is_garde_24h)
 
-    garde_24h_bonus = sum(garde_24h_bonuses) if garde_24h_bonuses else 0
+            # 1) Priorité pour les médecins dont la 1/2 journée off AM tombe le lendemain
+            if doc_id in off_next_apm_docs and v_nuit is not None:
+                garde_eve_off_bonuses.append(15 * v_nuit)
+
+            # 2) Continuité 3 créneaux (24h complète : Matin + AM + Nuit)
+            if v_matin is not None and v_am is not None and v_nuit is not None:
+                is_24h = model.NewBoolVar(f"is_garde_24h_{doc_id}_{d_idx}")
+                model.AddMinEquality(is_24h, [v_matin, v_am, v_nuit])
+                garde_continuity_bonuses.append(30 * is_24h)
+
+            # 3) Continuité 2 créneaux (si 1 créneau est pris par une tâche fixe)
+            if v_am is not None and v_nuit is not None:
+                is_am_nuit = model.NewBoolVar(f"is_garde_am_nuit_{doc_id}_{d_idx}")
+                model.AddMinEquality(is_am_nuit, [v_am, v_nuit])
+                garde_continuity_bonuses.append(10 * is_am_nuit)
+
+            if v_matin is not None and v_am is not None:
+                is_matin_am = model.NewBoolVar(f"is_garde_matin_am_{doc_id}_{d_idx}")
+                model.AddMinEquality(is_matin_am, [v_matin, v_am])
+                garde_continuity_bonuses.append(8 * is_matin_am)
+
+    garde_continuity_bonus = sum(garde_continuity_bonuses) if garde_continuity_bonuses else 0
+    garde_eve_off_bonus = sum(garde_eve_off_bonuses) if garde_eve_off_bonuses else 0
 
     # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
     # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
-    # ASTREINTE du groupe 3 (poids plus léger, 3 personnes chacune), l'équité
-    # Cs/ETT/EE pour l'ensemble des périmètres, le quota fixe
-    # Stress, le bonus de fidélité historique (Cs/ETT/EE), la priorité hors
-    # site et la préférence de remplissage Entrées PSS.
+    # ASTREINTE du groupe 3, l'équité Cs/ETT/EE pour l'ensemble des périmètres,
+    # la continuité des gardes (24h / même médecin), la priorité la veille des 1/2 off AM,
+    # le quota fixe Stress, le bonus de fidélité historique et les préférences hors site.
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
-        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus - (garde_24h_bonus * 10)
+        - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
+        - garde_continuity_bonus - garde_eve_off_bonus
     )
 
 

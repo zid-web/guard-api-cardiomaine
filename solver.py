@@ -2279,9 +2279,27 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     hors_site_bonus = sum(hors_site_priority_bonus) if hors_site_priority_bonus else 0
     reeduc_bonus = sum(reeduc_priority_bonus) if reeduc_priority_bonus else 0
 
-    # Préférence douce (pas une obligation) : P préfère la garde de nuit le
-    # mercredi (confirmé utilisateur 29/07/2026) - petit bonus, n'empêche pas
-    # P de faire garde nuit un autre jour si l'équité l'exige davantage.
+    # --- 10bis. Interne (I) toujours assigné à la Garde Matin (Lundi au Vendredi) ---
+    # en association avec le médecin senior de Garde AM du même jour.
+    for d_idx in range(5):
+        i_vac = is_on_vacation("I", days[d_idx], req.vacations) or is_on_vacation("I", days[d_idx], req.congres)
+        if not i_vac:
+            var_i_matin = x.get(("I", d_idx, "matin", "GARDE"))
+            if var_i_matin is None:
+                var_i_matin = model.NewBoolVar(f"garde_matin_interne_{d_idx}")
+                x[("I", d_idx, "matin", "GARDE")] = var_i_matin
+            model.Add(var_i_matin == 1)
+
+            for doc_id in medecins_map:
+                if doc_id == "I":
+                    continue
+                v_matin = x.get((doc_id, d_idx, "matin", "GARDE"))
+                v_am = x.get((doc_id, d_idx, "am", "GARDE"))
+                if v_matin is not None and v_am is not None:
+                    is_same_pair = model.NewBoolVar(f"garde_matin_am_pair_{doc_id}_{d_idx}")
+                    model.AddMinEquality(is_same_pair, [v_matin, v_am])
+                    garde_continuity_bonuses.append(50 * is_same_pair)
+
     p_mercredi_var = x.get(("P", 2, "nuit", "GARDE"))
     p_wednesday_bonus = 3 * p_mercredi_var if p_mercredi_var is not None else 0
     entrees_pss_bonus = sum(entrees_pss_fill_bonus) if entrees_pss_fill_bonus else 0

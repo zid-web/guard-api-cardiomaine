@@ -1359,7 +1359,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     week_num = week_start_d.isocalendar()[1]
     if 31 <= week_num <= 34:
         for d_idx in range(5):
-            for doc in ALL_DOCTORS:
+            for doc in medecins_map:
                 var = x.get((doc, d_idx, "am", "ASTREINTE"))
                 if var is not None:
                     model.Add(var == 0)

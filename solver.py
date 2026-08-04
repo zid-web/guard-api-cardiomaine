@@ -452,6 +452,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # --- 2. Création des variables ---
     model = cp_model.CpModel()
     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
+    half_days_off_conflict_keys = []
 
     def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
         return any(d == doc_id and day == day_name for d, day, _slot in RYTHMO_FORCE)
@@ -524,17 +525,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
         day_name = DAY_NAMES_FR[d_idx]
         if (day_name, slot) in half_days_off and doc_id in half_days_off[(day_name, slot)]:
-            # Exception : M ou W sur Coro/Astreinte mercredi après-midi (repli sous-effectif quand O est absent)
-            # ou toute tâche de garde/astreinte (autorisée sur 1/2 off).
-            is_coro_wom_bypass = (
-                activity in ("CORO", "ASTREINTE") and
-                doc_id in ("M", "W") and
-                day_name == "MERCREDI" and
-                slot == "am"
-            )
-            is_garde_ast = activity in ("GARDE", "ASTREINTE")
-            if not is_coro_wom_bypass and not is_garde_ast:
-                return
+            # La 1/2 journée off est souple : respectée par défaut via une pénalité (200),
+            # mais autorise la création de la variable pour couvrir les tâches sous-effectif/absences.
+            if activity not in ("GARDE", "ASTREINTE"):
+                half_days_off_conflict_keys.append((doc_id, d_idx, slot, activity))
 
         # RYTHMO : exclusion des AUTRES activités uniquement sur le(s) créneau(x)
         # réellement occupé par RYTHMO (précision par médecin - P=matin+am,
@@ -2341,17 +2335,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     garde_continuity_bonus = sum(garde_continuity_bonuses) if garde_continuity_bonuses else 0
     garde_eve_off_bonus = sum(garde_eve_off_bonuses) if garde_eve_off_bonuses else 0
 
-    # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
-    # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
-    # ASTREINTE du groupe 3, l'équité Cs/ETT/EE pour l'ensemble des périmètres,
-    # la continuité des gardes (24h / même médecin), la priorité la veille des 1/2 off AM,
-    # le quota fixe Stress, le bonus de fidélité historique et les préférences hors site.
+    half_days_off_penalties = []
+    for doc_id, d_idx, slot, act in half_days_off_conflict_keys:
+        var = x.get((doc_id, d_idx, slot, act))
+        if var is not None:
+            half_days_off_penalties.append(200 * var)
+    half_days_off_penalty = sum(half_days_off_penalties) if half_days_off_penalties else 0
+
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     nct_wed_penalty = sum(nct_wed_penalties) if 'nct_wed_penalties' in locals() and nct_wed_penalties else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
-        + astreinte_nuit_coro_matin_penalty + post_night_guard_penalty + nct_wed_penalty
+        + astreinte_nuit_coro_matin_penalty + post_night_guard_penalty + nct_wed_penalty + half_days_off_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
         - garde_continuity_bonus - garde_eve_off_bonus
     )

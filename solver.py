@@ -1271,6 +1271,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # Évite seulement de préférence (pénalité souple) la Coro / Astreinte ATL le matin du lendemain.
     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
     astreinte_nuit_coro_matin_penalties = []
+    post_night_guard_penalties = []
 
     for doc_id in medecins_map:
         for d_idx in range(6):  # LUNDI(0) à SAMEDI(5)
@@ -1332,7 +1333,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                                 coro_rythmo_next_day_vars.append(v)
 
                 for v in coro_rythmo_next_day_vars:
-                    model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
+                    pen_png = model.NewBoolVar(f"pen_png_{doc_id}_{d_idx}")
+                    model.AddBoolAnd([worked_night_garde, v]).OnlyEnforceIf(pen_png)
+                    model.AddBoolOr([worked_night_garde.Not(), v.Not()]).OnlyEnforceIf(pen_png.Not())
+                    post_night_guard_penalties.append(500 * pen_png)
 
             # 2) ASTREINTE NUIT (Souple le matin, autorisée l'après-midi)
             night_astreinte_vars = [
@@ -1358,6 +1362,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     astreinte_nuit_coro_matin_penalties.append(10 * penalty_var)
 
     astreinte_nuit_coro_matin_penalty = sum(astreinte_nuit_coro_matin_penalties) if astreinte_nuit_coro_matin_penalties else 0
+    post_night_guard_penalty = sum(post_night_guard_penalties) if post_night_guard_penalties else 0
 
     # Cas dimanche (semaine précédente) -> lundi (cette semaine) : le doctor est connu
     # à l'avance (transmis par le front), donc traité comme une exclusion fixe
@@ -1560,17 +1565,24 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if var_nct is not None:
                     model.Add(var_nct == 0)
 
-        # NCT interdit si astreinte nuit ou garde nuit la veille (mercredi)
+        # Eviter NCT si astreinte nuit ou garde nuit la veille (mercredi) - pénalité souple (400)
+        nct_wed_penalties = []
         for doc in nct_pool:
             if len(_nct_available_this_week) == 1 and _nct_available_this_week[0] == doc:
                 continue
             var_nct = x.get((doc, 3, "nuit", "NCT"))
             var_astreinte_mercredi = x.get((doc, 2, "nuit", "ASTREINTE"))
             if var_nct is not None and var_astreinte_mercredi is not None:
-                model.AddImplication(var_nct, var_astreinte_mercredi.Not())
+                pen_nct_ast = model.NewBoolVar(f"pen_nct_ast_{doc}")
+                model.AddBoolAnd([var_nct, var_astreinte_mercredi]).OnlyEnforceIf(pen_nct_ast)
+                model.AddBoolOr([var_nct.Not(), var_astreinte_mercredi.Not()]).OnlyEnforceIf(pen_nct_ast.Not())
+                nct_wed_penalties.append(400 * pen_nct_ast)
             var_garde_mercredi = x.get((doc, 2, "nuit", "GARDE"))
             if var_nct is not None and var_garde_mercredi is not None:
-                model.AddImplication(var_nct, var_garde_mercredi.Not())
+                pen_nct_gde = model.NewBoolVar(f"pen_nct_gde_{doc}")
+                model.AddBoolAnd([var_nct, var_garde_mercredi]).OnlyEnforceIf(pen_nct_gde)
+                model.AddBoolOr([var_nct.Not(), var_garde_mercredi.Not()]).OnlyEnforceIf(pen_nct_gde.Not())
+                nct_wed_penalties.append(400 * pen_nct_gde)
 
     # --- 5bis. REEDUC (obligatoire, 1 médecin exactement, Lundi/Mercredi/Vendredi am) ---
     # Mercredi : S fortement privilégié, R/K seulement en repli si S
@@ -2325,9 +2337,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # la continuité des gardes (24h / même médecin), la priorité la veille des 1/2 off AM,
     # le quota fixe Stress, le bonus de fidélité historique et les préférences hors site.
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
+    nct_wed_penalty = sum(nct_wed_penalties) if 'nct_wed_penalties' in locals() and nct_wed_penalties else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
-        + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty + astreinte_nuit_coro_matin_penalty
+        + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
+        + astreinte_nuit_coro_matin_penalty + post_night_guard_penalty + nct_wed_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
         - garde_continuity_bonus - garde_eve_off_bonus
     )

@@ -1270,9 +1270,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
 
     for doc_id in medecins_map:
-        for d_idx in range(4):  # LUNDI(0) à JEUDI(3) - PAS vendredi (Ven->Sam
-                                 # est un cas weekend dédié, voir 10bis / combo
-                                 # M-O-W, ne doit jamais être doublement bloqué ici)
+        for d_idx in range(6):  # LUNDI(0) à SAMEDI(5)
             night_vars = [
                 v for (doc, d, sl, act), v in x.items()
                 if doc == doc_id and d == d_idx and sl == "nuit" and act in ("GARDE", "ASTREINTE")
@@ -1285,14 +1283,32 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             model.Add(sum(night_vars) == 0).OnlyEnforceIf(worked_night.Not())
             post_night_guard_off_flags[(doc_id, d_idx)] = worked_night
 
-            next_day_name = DAY_NAMES_FR[d_idx + 1]
-            target_slot = target_off_slot_after_night_guard(doc_id, next_day_name)
+            if d_idx < 4:
+                next_day_name = DAY_NAMES_FR[d_idx + 1]
+                target_slot = target_off_slot_after_night_guard(doc_id, next_day_name)
 
-            other_vars_next_day = [
+                other_vars_next_day = [
+                    v for (doc, d, sl, act), v in x.items()
+                    if doc == doc_id and d == d_idx + 1 and sl == target_slot
+                ]
+                for v in other_vars_next_day:
+                    model.Add(v == 0).OnlyEnforceIf(worked_night)
+
+            # Règle stricte : Pas de Coro, Astreinte ATL ou Rythmo le lendemain d'une garde de nuit.
+            # Si le médecin est le seul disponible/éligible pour la Coro ou le Rythmo le lendemain,
+            # cette contrainte interdira à ce médecin de faire la garde de nuit la veille,
+            # forçant le solveur à choisir UN AUTRE MÉDECIN pour la garde de nuit.
+            coro_rythmo_next_day_vars = [
                 v for (doc, d, sl, act), v in x.items()
-                if doc == doc_id and d == d_idx + 1 and sl == target_slot
+                if doc == doc_id and d == d_idx + 1 and (
+                    act in ("CORO", "ASTREINTE", "RYTHMO") or
+                    act.startswith("HIST::Matin - Coro") or
+                    act.startswith("HIST::Apm - Coro") or
+                    act.startswith("HIST::Matin - Rythmo") or
+                    act.startswith("HIST::Apm - Rythmo")
+                )
             ]
-            for v in other_vars_next_day:
+            for v in coro_rythmo_next_day_vars:
                 model.Add(v == 0).OnlyEnforceIf(worked_night)
 
     # Cas dimanche (semaine précédente) -> lundi (cette semaine) : le doctor est connu
@@ -1302,10 +1318,6 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     if req.previous_sunday_guard_doctor:
         sunday_doc = req.previous_sunday_guard_doctor
         monday_name = DAY_NAMES_FR[0]
-        # Si RYTHMO est forcé sur le créneau de repos ciblé lundi, cette règle
-        # ne s'applique pas (RYTHMO prime) - mais uniquement en cas de
-        # chevauchement réel de créneau (ex: A ne fait Rythmo que l'am, donc
-        # un repos matin reste appliqué normalement).
         target_slot = target_off_slot_after_night_guard(sunday_doc, monday_name)
         rythmo_blocks_off = _is_rythmo_day(sunday_doc, monday_name) and target_slot in _rythmo_slots_for(sunday_doc, monday_name)
         if not rythmo_blocks_off:

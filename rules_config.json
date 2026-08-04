@@ -11,6 +11,11 @@
     "A": "PSS", "O": "PSS", "G": "PSS", "M": "PSS", "W": "PSS", "Z": "PSS", "H": "PSS", "P": "PSS",
     "B": "Tessee", "S": "Tessee", "U": "Tessee", "T": "Tessee", "V": "Tessee"
   },
+  "cs_pss_allowed": ["A", "H", "Z", "M", "W", "O", "G", "P"],
+  "cs_tessee_allowed": ["B", "S", "U", "V", "T"],
+  "ett_allowed": ["Z", "A", "R", "P", "M", "G", "S", "K", "H", "B", "Val"],
+  "ee_allowed": ["K", "V", "O", "W", "M", "Dass", "D", "R", "T", "H", "G", "U", "A"],
+  "ett_tessee_allowed": ["Val"],
   "rythmo_allowed": ["A", "U", "P"],
   "rythmo_schedule": {
     "P": ["MARDI"],

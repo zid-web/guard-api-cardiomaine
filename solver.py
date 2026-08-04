@@ -39,6 +39,7 @@ class Medecin(BaseModel):
     points_cs: int = 0
     points_ett: int = 0
     points_stress: int = 0
+    points_ee: int = 0
     # Pondération d'équité : 100 = charge cible normale (plein temps, sans ajustement
     # d'ancienneté). Une valeur < 100 réduit la charge cible de ce médecin (ex: 50 pour
     # un mi-temps, 70 pour un médecin senior dont la charge est volontairement allégée).
@@ -412,6 +413,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # Restriction Cs PSS vs Cs Tessée par médecin (confirmé utilisateur
     # 28/07/2026, exclusion stricte pour les 13 médecins concernés).
     CS_TYPE_ALLOWED: Dict[str, str] = rules.get("cs_type_allowed", {})
+    CS_PSS_ALLOWED = set(rules.get("cs_pss_allowed", ["A", "H", "Z", "M", "W", "O", "G", "P"]))
+    CS_TESSEE_ALLOWED = set(rules.get("cs_tessee_allowed", ["B", "S", "U", "V", "T"]))
+    ETT_ALLOWED = set(rules.get("ett_allowed", ["Z", "A", "R", "P", "M", "G", "S", "K", "H", "B", "Val"]))
+    EE_ALLOWED = set(rules.get("ee_allowed", ["K", "V", "O", "W", "M", "Dass", "D", "R", "T", "H", "G", "U", "A"]))
+    ETT_TESSEE_ALLOWED = set(rules.get("ett_tessee_allowed", ["Val"]))
     # ATL Matin/Midi/Soir = coronarographistes uniquement (M, O, W, FV, CH),
     # confirmé via DOC022 (28/07/2026) - PAS un pool large de PERMANENT.
     ASTREINTE_ALLOWED = set(rules.get("astreinte_allowed") or (list(CORO_ALLOWED) + ["CH"]))
@@ -961,10 +967,16 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     continue  # médecin externe/inactif, pas dans la requête courante
                 if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
                     continue
-                # Restriction Cs PSS vs Cs Tessée (confirmé utilisateur 28/07/2026)
-                if row_key.endswith("Cs PSS") and CS_TYPE_ALLOWED.get(doc_id) == "Tessee":
+                # Restrictions strictes de périmètres par activité (Cs PSS, Cs Tessée, ETT, EE, ETT Tessée)
+                if row_key.endswith("Cs PSS") and doc_id not in CS_PSS_ALLOWED:
                     continue
-                if row_key.endswith("Cs Tessée") and CS_TYPE_ALLOWED.get(doc_id) == "PSS":
+                if row_key.endswith("Cs Tessée") and doc_id not in CS_TESSEE_ALLOWED:
+                    continue
+                if ("ETT salle" in row_key or row_key.startswith("Matin - ETT") or row_key.startswith("Apm - ETT")) and doc_id not in ETT_ALLOWED:
+                    continue
+                if ("EE" in row_key) and doc_id not in EE_ALLOWED:
+                    continue
+                if ("ETT Tessée" in row_key) and doc_id not in ETT_TESSEE_ALLOWED:
                     continue
                 # VISITE (A/B/U en roulement, désigné en entrée) : pas de Cs le
                 # matin cette semaine pour le médecin en visite (confirmé
@@ -1342,6 +1354,16 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         else:
                             model.Add(var == 0)
 
+    # Astreintes ATL Midi fermées de S31 à S34 inclus de Lundi à Vendredi
+    week_start_d = date.fromisoformat(req.week_start_date)
+    week_num = week_start_d.isocalendar()[1]
+    if 31 <= week_num <= 34:
+        for d_idx in range(5):
+            for doc in ALL_DOCTORS:
+                var = x.get((doc, d_idx, "am", "ASTREINTE"))
+                if var is not None:
+                    model.Add(var == 0)
+
     # --- 4ter. Couverture quotidienne obligatoire Coro matin/am (lundi-
     # vendredi) - confirmé utilisateur 31/07/2026 : contrairement à la nuit
     # (structurée ci-dessus), le jour n'avait AUCUNE obligation de couverture
@@ -1475,11 +1497,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if var_nct is not None:
                     model.Add(var_nct == 0)
 
-        # NCT interdit si astreinte nuit la veille (mercredi) - sauf si un
-        # seul candidat NCT reste disponible cette semaine (confirmé
-        # utilisateur 31/07/2026, même assouplissement que ci-dessus : ce
-        # médecin peut alors être structurellement nécessaire à la fois pour
-        # l'astreinte du mercredi et la NCT du jeudi, faute d'alternative).
+        # NCT interdit si astreinte nuit ou garde nuit la veille (mercredi)
         for doc in nct_pool:
             if len(_nct_available_this_week) == 1 and _nct_available_this_week[0] == doc:
                 continue
@@ -1487,6 +1505,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             var_astreinte_mercredi = x.get((doc, 2, "nuit", "ASTREINTE"))
             if var_nct is not None and var_astreinte_mercredi is not None:
                 model.AddImplication(var_nct, var_astreinte_mercredi.Not())
+            var_garde_mercredi = x.get((doc, 2, "nuit", "GARDE"))
+            if var_nct is not None and var_garde_mercredi is not None:
+                model.AddImplication(var_nct, var_garde_mercredi.Not())
 
     # --- 5bis. REEDUC (obligatoire, 1 médecin exactement, Lundi/Mercredi/Vendredi am) ---
     # Mercredi : S fortement privilégié, R/K seulement en repli si S
@@ -1510,15 +1531,22 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     # --- 6. Fixes forcés (FV) ---
     if fv_id:
-        forced_list = [(3, "am", "CORO", 1)]
-        if req.fv_monday_night_active:
-            forced_list.append((0, "nuit", "GARDE", 1))
-        for d_idx, slot, act, forced_val in forced_list:
-            var = x.get((fv_id, d_idx, slot, act))
-            if var is not None:
-                model.Add(var == forced_val)
-            else:
-                warnings.append(f"FV : créneau {DAY_NAMES_FR[d_idx]} {slot} {act} non disponible")
+        fv_thu_vac = is_on_vacation("FV", days[3], req.vacations) or is_on_vacation("FV", days[3], req.congres)
+        if not fv_thu_vac:
+            var_fv_coro = x.get(("FV", 3, "am", "CORO"))
+            if var_fv_coro is not None:
+                model.Add(var_fv_coro == 1)
+
+        fv_mon_vac = is_on_vacation("FV", days[0], req.vacations) or is_on_vacation("FV", days[0], req.congres)
+        if not fv_mon_vac and req.fv_monday_night_active:
+            var_fv_garde = x.get(("FV", 0, "nuit", "GARDE"))
+            if var_fv_garde is not None:
+                model.Add(var_fv_garde == 1)
+        elif fv_mon_vac and req.fv_monday_night_active:
+            # Repli sur U si FV est absent le lundi soir
+            var_u_garde = x.get(("U", 0, "nuit", "GARDE"))
+            if var_u_garde is not None and not (is_on_vacation("U", days[0], req.vacations) or is_on_vacation("U", days[0], req.congres)):
+                model.Add(var_u_garde == 1)
 
     # --- 6bis. RYTHMO forcé sur le(s) créneau(x) exact(s) par jour/médecin ---
     # A = après-midi seulement (lundi, jeudi) ; P = matin+après-midi (mardi) ;
@@ -2011,19 +2039,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         model.Add(a_var == historical_astreinte + sum(this_week_astreinte))
         astreinte_g3_points[doc] = a_var
 
-    # --- Équité Groupe 1 (échographistes B,Z,H,G,S) : Cs / ETT / Stress,
-    # trois métriques séparées, scope 6 mois glissants (confirmé utilisateur
-    # 28/07/2026 - revient sur la décision précédente de les laisser
-    # purement informatives). Réutilise les variables déjà créées dans
-    # historical_vars (section 2bis), pas de nouvelles variables.
-    GROUPE1_IDS = {"B", "Z", "H", "G", "S"} & set(medecins_map)
+    # --- Équité élargie sur 6 mois pour tous les périmètres (Cs PSS/Tessée, ETT, EE) ---
     CS_ROW_KEYS = {"Matin - Cs PSS", "Matin - Cs Tessée", "Apm - Cs PSS", "Apm - Cs Tessée"}
-    ETT_ROW_KEYS = {"Matin - ETT salle 1", "Matin - ETT salle 2", "Apm - ETT salle 1", "Apm - ETT salle 2"}
+    ETT_ROW_KEYS = {"Matin - ETT salle 1", "Matin - ETT salle 2", "Apm - ETT salle 1", "Apm - ETT salle 2", "Matin - ETT Tessée", "Apm - ETT Tessée"}
+    EE_ROW_KEYS = {"Matin - EE1", "Apm - EE1", "Matin - EE2", "Apm - EE2", "Matin - EE", "Apm - EE"}
     STRESS_ROW_KEYS = {"Matin - Stress", "Apm - Stress"}
 
-    def _groupe1_points(row_keys: Set[str], historical_getter, label: str) -> Dict[str, Any]:
+    ALL_CS_DOCTORS = (CS_PSS_ALLOWED | CS_TESSEE_ALLOWED) & set(medecins_map)
+    ALL_ETT_DOCTORS = (ETT_ALLOWED | ETT_TESSEE_ALLOWED) & set(medecins_map)
+    ALL_EE_DOCTORS = EE_ALLOWED & set(medecins_map)
+
+    def _activity_equity_points(row_keys: Set[str], doctor_pool: Set[str], historical_getter, label: str) -> Dict[str, Any]:
         points: Dict[str, Any] = {}
-        for doc in GROUPE1_IDS:
+        for doc in doctor_pool:
             m = medecins_map[doc]
             historical = historical_getter(m)
             this_week_terms = [
@@ -2033,14 +2061,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 for doc_id_x, (var, _freq) in day_vars.items()
                 if doc_id_x == doc
             ]
-            upper_bound = historical + 7 + 5
-            var_total = model.NewIntVar(0, max(upper_bound, 1), f"g1_{label}_{doc}")
+            upper_bound = historical + 14
+            var_total = model.NewIntVar(0, max(upper_bound, 1), f"eq_{label}_{doc}")
             model.Add(var_total == historical + sum(this_week_terms))
             points[doc] = var_total
         return points
 
-    cs_points = _groupe1_points(CS_ROW_KEYS, lambda m: m.points_cs, "cs")
-    ett_points = _groupe1_points(ETT_ROW_KEYS, lambda m: m.points_ett, "ett")
+    cs_points = _activity_equity_points(CS_ROW_KEYS, ALL_CS_DOCTORS, lambda m: m.points_cs, "cs")
+    ett_points = _activity_equity_points(ETT_ROW_KEYS, ALL_ETT_DOCTORS, lambda m: m.points_ett, "ett")
+    ee_points = _activity_equity_points(EE_ROW_KEYS, ALL_EE_DOCTORS, lambda m: getattr(m, "points_ee", 0), "ee")
     # Stress RETIRÉ de l'équité groupe 1 (confirmé utilisateur 29/07/2026) :
     # ce n'est pas une répartition égale mais un QUOTA fixe assumé inégal
     # (K=3, B/S/H/G/Z=1 chacun quand K est présent) - voir plus bas.
@@ -2149,6 +2178,24 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     astreinte_g3_spread = _spread(astreinte_g3_points, "astreinte_g3")
     cs_spread = _spread(cs_points, "cs")
     ett_spread = _spread(ett_points, "ett")
+    ee_spread = _spread(ee_points, "ee")
+
+    # Cible de 3 vacations semaine par médecin pour M, W, O quand tous les 3 sont présents
+    mwo_target_terms = []
+    mwo_present = [doc for doc in ["M", "W", "O"] if doc in medecins_map and not all(is_on_vacation(doc, days[d], req.vacations) for d in range(5))]
+    if len(mwo_present) == 3:
+        for doc in ["M", "W", "O"]:
+            weekday_coro_vars = [
+                var for (doc_id_x, d_idx, slot, activity), var in x.items()
+                if doc_id_x == doc and activity == "CORO" and d_idx < 5
+            ]
+            if weekday_coro_vars:
+                count_expr = sum(weekday_coro_vars)
+                dev = model.NewIntVar(0, 5, f"mwo_weekday_coro_dev_{doc}")
+                model.Add(dev >= count_expr - 3)
+                model.Add(dev >= 3 - count_expr)
+                mwo_target_terms.append(dev * 10)
+    mwo_target_penalty = sum(mwo_target_terms) if mwo_target_terms else 0
 
     garde_24h_bonuses = []
     for d_idx in range(1, 7): # Mardi à Dimanche
@@ -2167,16 +2214,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # Un seul model.Minimize() possible avec CP-SAT : on combine l'équité
     # GARDE (poids fort, l'enjeu principal, 11 médecins), l'équité CORO et
     # ASTREINTE du groupe 3 (poids plus léger, 3 personnes chacune), l'équité
-    # Cs/ETT du groupe 1 (poids léger également, 5 personnes), le quota fixe
-    # Stress (K=3, autres=1 - pas une égalité, une pénalité d'écart à la
-    # cible), le bonus de fidélité historique (Cs/ETT/EE), la priorité hors
-    # site (ex: CDL, V > O) et la préférence de remplissage Entrées PSS - en
-    # une seule expression additive, chaque terme portant sur des activités
-    # disjointes (pas de double comptage entre eux).
+    # Cs/ETT/EE pour l'ensemble des périmètres, le quota fixe
+    # Stress, le bonus de fidélité historique (Cs/ETT/EE), la priorité hors
+    # site et la préférence de remplissage Entrées PSS.
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
-        + cs_spread + ett_spread + stress_quota_penalty
+        + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus - (garde_24h_bonus * 10)
     )
 

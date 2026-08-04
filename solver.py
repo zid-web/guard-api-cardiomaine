@@ -1259,57 +1259,95 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                 if slot_vars:
                     model.Add(sum(slot_vars) <= 1)
 
-    # --- 3bis. Règle dynamique : 1/2 journée off après garde de nuit ---
-    # Si un médecin travaille en garde/astreinte de nuit le jour d, il ne peut avoir
-    # aucune autre activité sur le créneau cible du jour d+1 (voir
-    # target_off_slot_after_night_guard ci-dessus). Réifié avec OnlyEnforceIf : la
-    # contrainte ne s'active QUE si la garde de nuit est effectivement retenue par le
-    # solveur cette semaine-là (pas une exclusion a priori comme half_days_off).
-    # Limité à d_idx 0..5 (lundi->samedi) : le cas dimanche->lundi traverse deux
-    # semaines, géré séparément juste après via previous_sunday_guard_doctor.
+    # --- 3bis. Règle dynamique : Repos et enchaînements après Garde / Astreinte de Nuit ---
+    # Règle GARDE NUIT (stricte) :
+    # Un médecin qui fait une GARDE de nuit (act == "GARDE") le jour d ne peut PAS
+    # faire Coro, Astreinte ATL ou Rythmo le lendemain (d+1).
+    # Si ce médecin est le seul éligible/disponible pour la Coro ou Rythmo le lendemain,
+    # CP-SAT choisira UN AUTRE MÉDECIN pour la GARDE de nuit le jour d.
+    #
+    # Règle ASTREINTE NUIT (souple) :
+    # Ne bloque JAMAIS la Coro ni l'Astreinte ATL le lendemain après-midi.
+    # Évite seulement de préférence (pénalité souple) la Coro / Astreinte ATL le matin du lendemain.
     post_night_guard_off_flags: Dict[tuple, Any] = {}  # (doc_id, d_idx) -> BoolVar "a fait une garde de nuit ce jour-là"
+    astreinte_nuit_coro_matin_penalties = []
 
     for doc_id in medecins_map:
         for d_idx in range(6):  # LUNDI(0) à SAMEDI(5)
-            night_vars = [
+            # 1) GARDE NUIT (Stricte)
+            night_garde_vars = [
                 v for (doc, d, sl, act), v in x.items()
-                if doc == doc_id and d == d_idx and sl == "nuit" and act in ("GARDE", "ASTREINTE")
+                if doc == doc_id and d == d_idx and sl == "nuit" and act == "GARDE"
             ]
-            if not night_vars:
-                continue
+            if night_garde_vars:
+                worked_night_garde = model.NewBoolVar(f"worked_night_garde_{doc_id}_{d_idx}")
+                model.Add(sum(night_garde_vars) >= 1).OnlyEnforceIf(worked_night_garde)
+                model.Add(sum(night_garde_vars) == 0).OnlyEnforceIf(worked_night_garde.Not())
+                post_night_guard_off_flags[(doc_id, d_idx)] = worked_night_garde
 
-            worked_night = model.NewBoolVar(f"worked_night_{doc_id}_{d_idx}")
-            model.Add(sum(night_vars) >= 1).OnlyEnforceIf(worked_night)
-            model.Add(sum(night_vars) == 0).OnlyEnforceIf(worked_night.Not())
-            post_night_guard_off_flags[(doc_id, d_idx)] = worked_night
+                if d_idx < 4:
+                    next_day_name = DAY_NAMES_FR[d_idx + 1]
+                    target_slot = target_off_slot_after_night_guard(doc_id, next_day_name)
+                    other_vars_next_day = [
+                        v for (doc, d, sl, act), v in x.items()
+                        if doc == doc_id and d == d_idx + 1 and sl == target_slot
+                    ]
+                    for v in other_vars_next_day:
+                        model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
 
-            if d_idx < 4:
-                next_day_name = DAY_NAMES_FR[d_idx + 1]
-                target_slot = target_off_slot_after_night_guard(doc_id, next_day_name)
-
-                other_vars_next_day = [
+                # Interdiction stricte Coro / Astreinte ATL / Rythmo le lendemain d'une GARDE de nuit
+                coro_rythmo_next_day_vars = [
                     v for (doc, d, sl, act), v in x.items()
-                    if doc == doc_id and d == d_idx + 1 and sl == target_slot
+                    if doc == doc_id and d == d_idx + 1 and (
+                        act in ("CORO", "ASTREINTE", "RYTHMO") or
+                        act.startswith("HIST::Matin - Coro") or
+                        act.startswith("HIST::Apm - Coro") or
+                        act.startswith("HIST::Matin - Rythmo") or
+                        act.startswith("HIST::Apm - Rythmo")
+                    )
                 ]
-                for v in other_vars_next_day:
-                    model.Add(v == 0).OnlyEnforceIf(worked_night)
+                for v in coro_rythmo_next_day_vars:
+                    model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
 
-            # Règle stricte : Pas de Coro, Astreinte ATL ou Rythmo le lendemain d'une garde de nuit.
+            # 2) ASTREINTE NUIT (Souple le matin, autorisée l'après-midi)
+            night_astreinte_vars = [
+                v for (doc, d, sl, act), v in x.items()
+                if doc == doc_id and d == d_idx and sl == "nuit" and act == "ASTREINTE"
+            ]
+            if night_astreinte_vars:
+                worked_night_ast = model.NewBoolVar(f"worked_night_ast_{doc_id}_{d_idx}")
+                model.Add(sum(night_astreinte_vars) >= 1).OnlyEnforceIf(worked_night_ast)
+                model.Add(sum(night_astreinte_vars) == 0).OnlyEnforceIf(worked_night_ast.Not())
+
+                coro_matin_next_day = [
+                    v for (doc, d, sl, act), v in x.items()
+                    if doc == doc_id and d == d_idx + 1 and sl == "matin" and (
+                        act in ("CORO", "ASTREINTE") or
+                        act.startswith("HIST::Matin - Coro")
+                    )
+                ]
+                for v in coro_matin_next_day:
+                    penalty_var = model.NewBoolVar(f"pen_ast_coro_{doc_id}_{d_idx}")
+                    model.AddBoolAnd([worked_night_ast, v]).OnlyEnforceIf(penalty_var)
+                    model.AddBoolOr([worked_night_ast.Not(), v.Not()]).OnlyEnforceIf(penalty_var.Not())
+                    astreinte_nuit_coro_matin_penalties.append(10 * penalty_var)
+            # Interdiction stricte Coro / Astreinte ATL / Rythmo le lendemain d'une GARDE de nuit.
             # Si le médecin est le seul disponible/éligible pour la Coro ou le Rythmo le lendemain,
             # cette contrainte interdira à ce médecin de faire la garde de nuit la veille,
             # forçant le solveur à choisir UN AUTRE MÉDECIN pour la garde de nuit.
-            coro_rythmo_next_day_vars = [
-                v for (doc, d, sl, act), v in x.items()
-                if doc == doc_id and d == d_idx + 1 and (
-                    act in ("CORO", "ASTREINTE", "RYTHMO") or
-                    act.startswith("HIST::Matin - Coro") or
-                    act.startswith("HIST::Apm - Coro") or
-                    act.startswith("HIST::Matin - Rythmo") or
-                    act.startswith("HIST::Apm - Rythmo")
-                )
-            ]
-            for v in coro_rythmo_next_day_vars:
-                model.Add(v == 0).OnlyEnforceIf(worked_night)
+            if night_garde_vars:
+                coro_rythmo_next_day_vars = [
+                    v for (doc, d, sl, act), v in x.items()
+                    if doc == doc_id and d == d_idx + 1 and (
+                        act in ("CORO", "ASTREINTE", "RYTHMO") or
+                        act.startswith("HIST::Matin - Coro") or
+                        act.startswith("HIST::Apm - Coro") or
+                        act.startswith("HIST::Matin - Rythmo") or
+                        act.startswith("HIST::Apm - Rythmo")
+                    )
+                ]
+                for v in coro_rythmo_next_day_vars:
+                    model.Add(v == 0).OnlyEnforceIf(worked_night_garde)
 
     # Cas dimanche (semaine précédente) -> lundi (cette semaine) : le doctor est connu
     # à l'avance (transmis par le front), donc traité comme une exclusion fixe
@@ -2257,7 +2295,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
-        + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
+        + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty + astreinte_nuit_coro_matin_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
         - garde_continuity_bonus - garde_eve_off_bonus
     )

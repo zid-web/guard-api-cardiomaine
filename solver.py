@@ -1630,6 +1630,25 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     for doc_id, day_name, slot in RYTHMO_FORCE:
         _force_rythmo(doc_id, day_name, slot)
 
+    # Pénalité forte (pas un blocage dur) : "pas de rythmo le lendemain d'une
+    # garde de nuit" (confirmé utilisateur 01/08/2026). Rythmo étant FORCÉ
+    # (ci-dessus), on ne peut pas l'empêcher une fois forcé sans risquer une
+    # infaisabilité si ce médecin est le seul candidat garde de nuit
+    # disponible la veille - on décourage donc fortement plutôt que
+    # d'interdire, pour rester robuste dans les cas de sous-effectif.
+    rythmo_forced_days_by_doc: Dict[str, set] = {}
+    for doc_id, day_name, _slot in RYTHMO_FORCE:
+        rythmo_forced_days_by_doc.setdefault(doc_id, set()).add(day_name)
+    for doc_id, forced_days in rythmo_forced_days_by_doc.items():
+        for d_idx in range(6):  # lundi-samedi (garde nuit veille d'un jour rythmo)
+            next_day_name = DAY_NAMES_FR[d_idx + 1] if d_idx + 1 < 7 else None
+            if not next_day_name or next_day_name not in forced_days:
+                continue
+            for act in ("GARDE", "ASTREINTE"):
+                garde_var = x.get((doc_id, d_idx, "nuit", act))
+                if garde_var is not None:
+                    hors_site_priority_bonus.append(-30 * garde_var)
+
     # --- 7. Règles d'exclusion métier ---
     # 7.1 retirée (28/07/2026) : redondante avec la section 3bis (repos
     # dynamique après garde de nuit) et incorrecte - elle bloquait

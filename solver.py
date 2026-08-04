@@ -1414,15 +1414,18 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         else:
                             model.Add(var == 0)
 
-    # Astreintes ATL Midi fermées de S31 à S34 inclus de Lundi à Vendredi
+    # Astreintes ATL Midi & Coro AM fermées de S31 à S34 inclus de Lundi à Vendredi
     week_start_d = date.fromisoformat(req.week_start_date)
     week_num = week_start_d.isocalendar()[1]
     if 31 <= week_num <= 34:
         for d_idx in range(5):
             for doc in medecins_map:
-                var = x.get((doc, d_idx, "am", "ASTREINTE"))
-                if var is not None:
-                    model.Add(var == 0)
+                var_ast = x.get((doc, d_idx, "am", "ASTREINTE"))
+                if var_ast is not None:
+                    model.Add(var_ast == 0)
+                var_coro = x.get((doc, d_idx, "am", "CORO"))
+                if var_coro is not None:
+                    model.Add(var_coro == 0)
 
     # --- 4ter. Couverture quotidienne obligatoire Coro matin/am (lundi-
     # vendredi) - confirmé utilisateur 31/07/2026 : contrairement à la nuit

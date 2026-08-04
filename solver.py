@@ -524,7 +524,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
         day_name = DAY_NAMES_FR[d_idx]
         if (day_name, slot) in half_days_off and doc_id in half_days_off[(day_name, slot)]:
-            return
+            # Exception : M ou W sur Coro/Astreinte mercredi après-midi (repli sous-effectif quand O est absent)
+            # ou toute tâche de garde/astreinte (autorisée sur 1/2 off).
+            is_coro_wom_bypass = (
+                activity in ("CORO", "ASTREINTE") and
+                doc_id in ("M", "W") and
+                day_name == "MERCREDI" and
+                slot == "am"
+            )
+            is_garde_ast = activity in ("GARDE", "ASTREINTE")
+            if not is_coro_wom_bypass and not is_garde_ast:
+                return
 
         # RYTHMO : exclusion des AUTRES activités uniquement sur le(s) créneau(x)
         # réellement occupé par RYTHMO (précision par médecin - P=matin+am,
@@ -2513,16 +2523,57 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     doctor=c.doctor_id, note="Saisie congrès"
                 ))
 
-    # 1/2 journée libre : dérivée directement de la règle métier déjà codée (half_days_off).
+    # 1/2 journée libre : dérivée de half_days_off, déplacée dynamiquement si le médecin est sollicité pour remplacer (ex: Coro mercredi AM quand O est absent).
     for (day_name_key, slot_key), doctors_off in half_days_off.items():
-        d_idx = DAY_NAMES_FR.index(day_name_key)
+        orig_d_idx = DAY_NAMES_FR.index(day_name_key)
         for doc in doctors_off:
-            if doc in medecins_map:
+            if doc not in medecins_map:
+                continue
+
+            # Vérifier si le médecin a été affecté à une tâche clinique (ex: Coro, CS, ETT, EE, etc.) sur ce créneau fixe
+            worked_clinical = any(
+                a.doctor == doc and a.date == days[orig_d_idx].isoformat() and a.slot == slot_key
+                and a.activity not in ("GARDE", "ASTREINTE", "CONGES", "CONGRES", "DEMI_JOURNEE_LIBRE")
+                for a in assignments
+            )
+
+            if not worked_clinical:
                 assignments.append(Assignment(
-                    date=days[d_idx].isoformat(), day_name=day_name_key,
+                    date=days[orig_d_idx].isoformat(), day_name=day_name_key,
                     slot=slot_key, activity="DEMI_JOURNEE_LIBRE",
                     doctor=doc, note="Règle fixe demi-journée libre"
                 ))
+            else:
+                # La 1/2 journée off est déplacée ! Chercher un autre après-midi libre (du Lundi au Vendredi)
+                shifted_d_idx = None
+                for candidate_d_idx in range(5):  # LUNDI à VENDREDI
+                    if candidate_d_idx == orig_d_idx:
+                        continue
+                    cand_date_str = days[candidate_d_idx].isoformat()
+                    has_task = any(
+                        a.doctor == doc and a.date == cand_date_str and a.slot == slot_key
+                        for a in assignments
+                    )
+                    if not has_task and not is_on_vacation(doc, days[candidate_d_idx], req.vacations):
+                        shifted_d_idx = candidate_d_idx
+                        break
+
+                if shifted_d_idx is not None:
+                    shifted_day_name = DAY_NAMES_FR[shifted_d_idx]
+                    assignments.append(Assignment(
+                        date=days[shifted_d_idx].isoformat(), day_name=shifted_day_name,
+                        slot=slot_key, activity="DEMI_JOURNEE_LIBRE",
+                        doctor=doc, note=f"1/2 journée off AM déplacée depuis {day_name_key} (remplacement Coro/sous-effectif)"
+                    ))
+                    warnings.append(
+                        f"1/2 journée off AM de {doc} sur {day_name_key} sollicitée pour remplacement - "
+                        f"déplacée au {shifted_day_name} après-midi."
+                    )
+                else:
+                    warnings.append(
+                        f"1/2 journée off AM de {doc} sur {day_name_key} sollicitée pour remplacement - "
+                        f"aucun autre après-midi libre cette semaine, reportée à la semaine suivante (+0.5)."
+                    )
 
     # Trier
     assignments.sort(key=lambda a: (a.date, SLOTS.index(a.slot) if a.slot in SLOTS else 999))

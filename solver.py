@@ -1412,7 +1412,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     else:
                         model.Add(var == 0)
             if wom_vars:
-                model.Add(sum(wom_vars) == 1)  # exactement un médecin WOM
+                has_wom = model.NewBoolVar(f"has_wom_ast_{d_idx}")
+                model.Add(sum(wom_vars) >= 1).OnlyEnforceIf(has_wom)
+                model.Add(sum(wom_vars) == 0).OnlyEnforceIf(has_wom.Not())
+                model.Add(sum(wom_vars) <= 1)
+                hors_site_priority_bonus.append(1000 * has_wom)
+                # Fallback CH si aucun médecin WOM n'est disponible
+                for (doc, d, sl, act), var in x.items():
+                    if d == d_idx and sl == "nuit" and act == "ASTREINTE" and doc == "CH":
+                        model.Add(var == 1).OnlyEnforceIf(has_wom.Not())
             else:
                 warnings.append(f"Jour {DAY_NAMES_FR[d_idx]} : aucun médecin W/O/M disponible, CH utilisé")
                 # Fallback CH
@@ -1545,7 +1553,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             )
     else:
         if nct_vars:
-            model.Add(sum(nct_vars) == 1)
+            has_nct = model.NewBoolVar("has_nct_cov")
+            model.Add(sum(nct_vars) >= 1).OnlyEnforceIf(has_nct)
+            model.Add(sum(nct_vars) == 0).OnlyEnforceIf(has_nct.Not())
+            model.Add(sum(nct_vars) <= 1)
+            hors_site_priority_bonus.append(1000 * has_nct)
         else:
             warnings.append("JEUDI : aucun médecin disponible pour la NCT (vacances ou exclu)")
 
@@ -1599,7 +1611,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             continue
         reeduc_vars = [v for (doc, d, sl, act), v in x.items() if d == d_idx and sl == "am" and act == "REEDUC"]
         if reeduc_vars:
-            model.Add(sum(reeduc_vars) == 1)
+            has_reeduc = model.NewBoolVar(f"has_reeduc_{d_idx}")
+            model.Add(sum(reeduc_vars) >= 1).OnlyEnforceIf(has_reeduc)
+            model.Add(sum(reeduc_vars) == 0).OnlyEnforceIf(has_reeduc.Not())
+            model.Add(sum(reeduc_vars) <= 1)
+            reeduc_priority_bonus.append(1000 * has_reeduc)
             if day_nm == "MERCREDI":
                 for (doc, d, sl, act), v in x.items():
                     if d == d_idx and sl == "am" and act == "REEDUC":
@@ -1840,11 +1856,19 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                         model.Add(v_mardi_nuit == 0).OnlyEnforceIf(is_astreinte_anchor[doc])
 
             if is_astreinte_anchor:
-                model.Add(sum(is_astreinte_anchor.values()) == 1)
+                has_ast_anch = model.NewBoolVar("has_ast_anch")
+                model.Add(sum(is_astreinte_anchor.values()) >= 1).OnlyEnforceIf(has_ast_anch)
+                model.Add(sum(is_astreinte_anchor.values()) == 0).OnlyEnforceIf(has_ast_anch.Not())
+                model.Add(sum(is_astreinte_anchor.values()) <= 1)
+                combo_priority_bonus.append(1000 * has_ast_anch)
             else:
                 warnings.append("Weekend combo : aucun médecin W/O/M disponible pour le rôle astreinte.")
             if is_garde_anchor:
-                model.Add(sum(is_garde_anchor.values()) == 1)
+                has_gde_anch = model.NewBoolVar("has_gde_anch")
+                model.Add(sum(is_garde_anchor.values()) >= 1).OnlyEnforceIf(has_gde_anch)
+                model.Add(sum(is_garde_anchor.values()) == 0).OnlyEnforceIf(has_gde_anch.Not())
+                model.Add(sum(is_garde_anchor.values()) <= 1)
+                combo_priority_bonus.append(1000 * has_gde_anch)
             else:
                 warnings.append("Weekend combo : aucun médecin W/O/M disponible pour le rôle garde.")
 

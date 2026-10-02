@@ -85,6 +85,12 @@ class PartialAbsence(BaseModel):
 class GenerateWeekRequest(BaseModel):
     week_start_date: str              # YYYY-MM-DD (lundi)
     week_type: int                    # 1 = impaire, 2 = paire
+    astreinte_week_type: Optional[int] = None  # roulement astreintes ATL CH / W-O-M :
+                                                # 1 = semaine CH (nuits Lun/Mar/Ven + week-end),
+                                                # 2 = semaine WOM. Absent -> week_type. Diffère de
+                                                # week_type à partir de 2027-W01 (roulement inversé,
+                                                # consigne 02/10/2026) ; week_type garde Rythmo /
+                                                # Coro vendredi.
     medecins: List[Medecin]
     vacations: List[Vacation] = []
     congres: List[Vacation] = []      # même structure que vacations : doctor_id, start_date, end_date
@@ -1388,8 +1394,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             )
 
     # --- 4. Structure des astreintes de nuit (Lundi à Vendredi) avec alternance CH/WOM ---
-    # week_type: 1 = impaire, 2 = paire
-    if req.week_type == 1:
+    # astreinte_week_type (repli week_type) : 1 = semaine CH, 2 = semaine WOM
+    if (req.astreinte_week_type or req.week_type) == 1:
         structure = {0: "CH", 1: "CH", 2: "WOM", 3: "WOM", 4: "CH"}
     else:
         structure = {0: "WOM", 1: "WOM", 2: "CH", 3: "CH", 4: "WOM"}
@@ -1784,7 +1790,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             model.AddAllowedAssignments([m_type, a_type, n_type], ALLOWED_SEQUENCES)
 
     # --- 9. Weekend : alternance CH / WOM pour les astreintes ---
-    weekend_group = "CH" if req.week_type == 1 else "WOM"
+    weekend_group = "CH" if (req.astreinte_week_type or req.week_type) == 1 else "WOM"
 
     if weekend_group == "CH":
         # CH sur toutes les astreintes du weekend (Matin, AM, Nuit)

@@ -140,6 +140,8 @@ class GenerateWeekRequest(BaseModel):
     last_combo_garde_date: Optional[str] = None  # Date (YYYY-MM-DD) du dernier weekend combo effectué
                                                    # par last_combo_garde_doctor - sert à calculer l'écart
                                                    # de 15 jours.
+    app_rules: Optional[Dict[str, Any]] = None  # consignes de l'appli (cases fermées, gardes, limites hebdo),
+                                                 # voir app_rules.py et docs/SOLVER-CONTRACT.md côté front
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -161,6 +163,8 @@ class GenerateWeekResponse(BaseModel):
     week_start_date: str
     assignments: List[Assignment]
     warnings: List[str] = []
+    applied_rules: Optional[Dict[str, Any]] = None  # accusé de réception de app_rules
+    rules_version: Optional[int] = None
 
 # ============================================================
 # 2. UTILITAIRES
@@ -2392,6 +2396,14 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     nct_wed_penalty = sum(nct_wed_penalties) if 'nct_wed_penalties' in locals() and nct_wed_penalties else 0
+    applied_rules_summary = None
+    if req.app_rules:
+        try:
+            from app_rules import apply_app_rules
+            applied_rules_summary = apply_app_rules(model, x, req.app_rules, set(medecins_map), warnings)
+        except Exception as e:  # ne jamais casser la génération à cause des consignes
+            warnings.append(f"app_rules ignoré (erreur): {e}")
+
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
@@ -2625,5 +2637,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     return GenerateWeekResponse(
         week_start_date=req.week_start_date,
         assignments=assignments,
-        warnings=warnings
+        warnings=warnings,
+        applied_rules=applied_rules_summary,
+        rules_version=(req.app_rules or {}).get("version") if applied_rules_summary else None,
     )

@@ -71,6 +71,16 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
         for (d, di), v in night.items():
             if di == 4 and d not in pool:
                 model.Add(v == 0)
+    # Vendredi à égalité : bonus proportionnel au retard de chaque médecin du pool
+    counts = ng.get("friday_counts") or {}
+    if pool and isinstance(counts, dict):
+        top = max([int(counts.get(d, 0)) for d in pool] or [0])
+        for (d, di), v in night.items():
+            if di == 4 and d in pool:
+                lag = top - int(counts.get(d, 0))
+                if lag > 0:
+                    bonus.append(30 * lag * v)
+        applied["friday_equality"] = True
     for doc in ng.get("never_friday") or []:
         v = night.get((doc, 4))
         if v is not None:

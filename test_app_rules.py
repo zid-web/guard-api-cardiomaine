@@ -81,3 +81,15 @@ def test_mardi_pool():
 
 if __name__ == "__main__":
     test_mardi_pool(); print("OK5")
+
+def test_vendredi_egalite():
+    pool = ["B", "G", "A", "P", "Z", "H", "S", "U"]
+    counts = {d: 5 for d in pool}; counts["H"] = 0
+    rules = {"version": 1, "night_guard": {"friday_pool": pool, "friday_counts": counts, "never_friday": ["O", "W", "M"]}}
+    r = generate_week(_req(rules))
+    ven = [a.doctor for a in r.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "VENDREDI"]
+    assert r.applied_rules["friday_equality"]
+    assert ven == ["H"], ven
+
+if __name__ == "__main__":
+    test_vendredi_egalite(); print("OK6")

@@ -70,3 +70,14 @@ def test_entrees_pss_binome():
 
 if __name__ == "__main__":
     test_entrees_pss_binome(); print("OK3")
+
+def test_mardi_pool():
+    rules = {"version": 1, "night_guard": {"day_preferences": {"MARDI": {"prefer": ["G", "B", "M", "W"]}}}}
+    for ws in ("2026-10-19", "2026-11-02", "2026-11-16"):
+        r = _req(rules); r.week_start_date = ws; r.week_type = 1
+        out = generate_week(r)
+        mardi = [a.doctor for a in out.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "MARDI"]
+        assert mardi and mardi[0] in ("G", "B", "M", "W"), (ws, mardi)
+
+if __name__ == "__main__":
+    test_mardi_pool(); print("OK5")

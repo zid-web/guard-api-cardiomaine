@@ -75,6 +75,23 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
         v = night.get((doc, 4))
         if v is not None:
             model.Add(v == 0)
+    # Préférences / pools par jour (NIGHT_GUARD_DAY_RULES côté appli)
+    n_prefs = 0
+    for day, rule in (ng.get("day_preferences") or {}).items():
+        if day not in DAY_NAMES_FR:
+            continue
+        di = DAY_NAMES_FR.index(day)
+        only = rule.get("only")
+        prefer = rule.get("prefer")
+        for (d, dd), v in night.items():
+            if dd != di:
+                continue
+            if only and d not in only:
+                model.Add(v == 0)
+            elif prefer and d in prefer:
+                bonus.append(40 * v)
+                n_prefs += 1
+    applied["night_guard_day_preferences"] = n_prefs
     if ng.get("no_consecutive_nights"):
         docs = {d for (d, _di) in night}
         for doc in docs:

@@ -107,3 +107,16 @@ def test_vendredi_egalite():
 
 if __name__ == "__main__":
     test_vendredi_egalite(); print("OK6")
+
+def test_mercredi_s_p_alternent():
+    prefs = {"MERCREDI": {"prefer": ["S", "P"]}}
+    r = _req({"version": 1, "night_guard": {"day_preferences": prefs, "day_counts": {"MERCREDI": {"S": 0, "P": 4}}}})
+    r.week_start_date = "2026-11-16"; r.week_type = 1
+    out = generate_week(r)
+    mer = [a.doctor for a in out.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "MERCREDI"]
+    assert mer == ["S"], mer
+    ett = [a.doctor for a in out.assignments if a.day_name == "MERCREDI" and a.slot == "am" and "ETT salle 1" in a.activity]
+    assert ett == ["S"], ett  # ETT ped conservée avec la garde
+
+if __name__ == "__main__":
+    test_mercredi_s_p_alternent(); print("OK7")

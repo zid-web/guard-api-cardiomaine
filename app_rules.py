@@ -101,6 +101,13 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
             elif prefer and d in prefer:
                 bonus.append(40 * v)
                 n_prefs += 1
+                # Égalité entre les médecins préférés du jour (ex. mercredi S / P) selon l'historique
+                day_counts = (ng.get("day_counts") or {}).get(day) or {}
+                if day_counts:
+                    top = max(int(day_counts.get(p, 0)) for p in prefer)
+                    lag = top - int(day_counts.get(d, 0))
+                    if lag > 0:
+                        bonus.append(min(lag, 4) * 30 * v)
     applied["night_guard_day_preferences"] = n_prefs
     if ng.get("no_consecutive_nights"):
         docs = {d for (d, _di) in night}

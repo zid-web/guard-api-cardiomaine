@@ -140,6 +140,8 @@ class GenerateWeekRequest(BaseModel):
     last_combo_garde_date: Optional[str] = None  # Date (YYYY-MM-DD) du dernier weekend combo effectué
                                                    # par last_combo_garde_doctor - sert à calculer l'écart
                                                    # de 15 jours.
+    app_rules: Optional[Dict[str, Any]] = None  # consignes de l'appli (cases fermées, gardes, limites hebdo),
+                                                 # voir app_rules.py et docs/SOLVER-CONTRACT.md côté front
     existing_schedule: Optional[Dict[str, List[str]]] = None  # clé "row_key||day_name" -> [doctors]
     rules_override: Optional[Dict[str, Any]] = None  # surcharge partielle de rules_config.json, sans redéploiement
     historical_patterns: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None
@@ -161,6 +163,8 @@ class GenerateWeekResponse(BaseModel):
     week_start_date: str
     assignments: List[Assignment]
     warnings: List[str] = []
+    applied_rules: Optional[Dict[str, Any]] = None  # accusé de réception de app_rules
+    rules_version: Optional[int] = None
 
 # ============================================================
 # 2. UTILITAIRES
@@ -1126,7 +1130,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     doublon_bonus = sum(doublon_bonus_terms) if doublon_bonus_terms else 0
 
     # --- 2quater. Entrées PSS (confirmé avec l'utilisateur le 26/07/2026) ---
-    # Lundi/mardi : roulement parmi les médecins affectés ce jour-là en Apm -
+    # Lundi/mardi (consigne 12/10/2026) : binôme = médecin de garde d'après-midi + 1 autre médecin.
+    # L'autre médecin : roulement parmi les médecins affectés ce jour-là en Apm -
     # ETT salle 1/2, Apm - Stress, Apm - Cs PSS ou Apm - Cs Tessée (le "pool
     # clinique" de l'après-midi), à l'EXCLUSION de tout médecin qui, ce même
     # jour (n'importe quel créneau), fait CORO, RYTHMO, ou une activité hors
@@ -1141,8 +1146,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     entrees_pss_activity = "HIST::Entrées PSS"
     entrees_pss_fill_bonus: List[Any] = []
 
-    for d_idx in (0, 1):  # LUNDI, MARDI - roulement pool clinique
+    for d_idx in (0, 1):  # LUNDI, MARDI - binôme : médecin de garde d'après-midi + 1 autre (pool clinique)
         day_name = DAY_NAMES_FR[d_idx]
+        garde_midi_vars = {
+            doc_id_x: v for (doc_id_x, dd, sl, act), v in x.items()
+            if dd == d_idx and sl == "am" and act == "GARDE"
+        }
         clinic_vars_by_doc: Dict[str, List[Any]] = {}
         for (doc_id_x, dd, sl, act), var in list(x.items()):
             if dd != d_idx or not act.startswith("HIST::"):
@@ -1150,8 +1159,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if act[len("HIST::"):] in ENTREES_PSS_CLINIC_ROW_KEYS:
                 clinic_vars_by_doc.setdefault(doc_id_x, []).append(var)
 
-        day_vars: Dict[str, Any] = {}
+        # Le médecin de garde d'après-midi est toujours dans le binôme (jumelage direct).
+        for doc_id_x, garde_var in garde_midi_vars.items():
+            var = model.NewBoolVar(f"entreespss_{doc_id_x}_{d_idx}")
+            x[(doc_id_x, d_idx, "am", entrees_pss_activity)] = var
+            model.Add(var == garde_var)
+
+        # L'autre médecin : roulement parmi le pool clinique (hors garde midi).
+        other_vars: Dict[str, Any] = {}
         for doc_id_x, vlist in clinic_vars_by_doc.items():
+            if doc_id_x in garde_midi_vars:
+                continue
             in_clinic_pool = model.NewBoolVar(f"clinic_pool_{doc_id_x}_{d_idx}")
             model.AddMaxEquality(in_clinic_pool, vlist)
 
@@ -1170,23 +1188,21 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             for ev in exclusion_vars:
                 model.Add(var == 0).OnlyEnforceIf(ev)
 
-            day_vars[doc_id_x] = var
+            other_vars[doc_id_x] = var
 
-        if day_vars:
-            model.Add(sum(day_vars.values()) <= 1)
+        if other_vars:
+            model.Add(sum(other_vars.values()) <= 1)
             # Forte préférence de remplissage (pas une obligation stricte, pour
             # éviter une infaisabilité si tous les candidats du pool clinique
-            # sont par ailleurs exclus ce jour-là) : sans ce bonus, l'activité
-            # étant purement optionnelle, le solveur la laisserait vide par
-            # défaut faute de coût associé à ne pas la remplir.
+            # sont par ailleurs exclus ce jour-là).
             filled_var = model.NewBoolVar(f"entreespss_filled_{d_idx}")
-            model.AddMaxEquality(filled_var, list(day_vars.values()))
+            model.AddMaxEquality(filled_var, list(other_vars.values()))
             entrees_pss_fill_bonus.append(20 * filled_var)
-            if not clinic_vars_by_doc:
-                warnings.append(
-                    f"Entrées PSS {day_name} : aucun médecin en Cs/ETT/Stress "
-                    f"cet après-midi d'après l'historique reçu - rien à proposer."
-                )
+        elif not garde_midi_vars:
+            warnings.append(
+                f"Entrées PSS {day_name} : aucun médecin en Cs/ETT/Stress "
+                f"cet après-midi d'après l'historique reçu - rien à proposer."
+            )
 
     for d_idx in (2, 3, 4):  # MERCREDI, JEUDI, VENDREDI - jumelé au garde de garde Midi
         day_name = DAY_NAMES_FR[d_idx]
@@ -2392,12 +2408,23 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     nct_wed_penalty = sum(nct_wed_penalties) if 'nct_wed_penalties' in locals() and nct_wed_penalties else 0
+    applied_rules_summary = None
+    app_rules_bonus_terms: List[Any] = []
+    if req.app_rules:
+        try:
+            from app_rules import apply_app_rules
+            applied_rules_summary, app_rules_bonus_terms = apply_app_rules(
+                model, x, req.app_rules, set(medecins_map), warnings, req.existing_schedule)
+        except Exception as e:  # ne jamais casser la génération à cause des consignes
+            warnings.append(f"app_rules ignoré (erreur): {e}")
+
     model.Minimize(
         (max_points - min_points) + coro_spread + astreinte_g3_spread
         + cs_spread + ett_spread + ee_spread + mwo_target_penalty + stress_quota_penalty
         + astreinte_nuit_coro_matin_penalty + post_night_guard_penalty + nct_wed_penalty + half_days_off_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
         - garde_continuity_bonus - garde_eve_off_bonus
+        - (sum(app_rules_bonus_terms) if app_rules_bonus_terms else 0)
     )
 
 
@@ -2625,5 +2652,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     return GenerateWeekResponse(
         week_start_date=req.week_start_date,
         assignments=assignments,
-        warnings=warnings
+        warnings=warnings,
+        applied_rules=applied_rules_summary,
+        rules_version=(req.app_rules or {}).get("version") if applied_rules_summary else None,
     )

@@ -70,3 +70,40 @@ def test_entrees_pss_binome():
 
 if __name__ == "__main__":
     test_entrees_pss_binome(); print("OK3")
+
+def test_coro_un_chacun():
+    rules = {"version": 1, "coro_one_each_per_day": {"doctors": ["M", "O", "W"], "penalty": 80}}
+    r = generate_week(_req(rules))
+    assert r.applied_rules["coro_one_each_per_day"]
+    load = {}
+    for a in r.assignments:
+        if a.doctor in "MOW" and ((a.activity == "CORO") or (a.slot == "nuit" and a.activity in ("ASTREINTE", "GARDE"))) and a.day_name in ("LUNDI","MARDI","MERCREDI","VENDREDI"):
+            load[(a.day_name, a.doctor)] = load.get((a.day_name, a.doctor), 0) + 1
+    print("charges M/O/W par jour:", load)
+    for day in ("LUNDI", "MARDI", "MERCREDI", "VENDREDI"):
+        assert max([load.get((day, d), 0) for d in "MOW"]) <= 2
+
+if __name__ == "__main__":
+    test_coro_un_chacun(); print("OK4")
+def test_mardi_pool():
+    rules = {"version": 1, "night_guard": {"day_preferences": {"MARDI": {"prefer": ["G", "B", "M", "W"]}}}}
+    for ws in ("2026-10-19", "2026-11-02", "2026-11-16"):
+        r = _req(rules); r.week_start_date = ws; r.week_type = 1
+        out = generate_week(r)
+        mardi = [a.doctor for a in out.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "MARDI"]
+        assert mardi and mardi[0] in ("G", "B", "M", "W"), (ws, mardi)
+
+if __name__ == "__main__":
+    test_mardi_pool(); print("OK5")
+
+def test_vendredi_egalite():
+    pool = ["B", "G", "A", "P", "Z", "H", "S", "U"]
+    counts = {d: 5 for d in pool}; counts["H"] = 0
+    rules = {"version": 1, "night_guard": {"friday_pool": pool, "friday_counts": counts, "never_friday": ["O", "W", "M"]}}
+    r = generate_week(_req(rules))
+    ven = [a.doctor for a in r.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "VENDREDI"]
+    assert r.applied_rules["friday_equality"]
+    assert ven == ["H"], ven
+
+if __name__ == "__main__":
+    test_vendredi_egalite(); print("OK6")

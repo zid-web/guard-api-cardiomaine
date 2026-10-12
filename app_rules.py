@@ -71,10 +71,37 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
         for (d, di), v in night.items():
             if di == 4 and d not in pool:
                 model.Add(v == 0)
+    # Vendredi à égalité : bonus proportionnel au retard de chaque médecin du pool
+    counts = ng.get("friday_counts") or {}
+    if pool and isinstance(counts, dict):
+        top = max([int(counts.get(d, 0)) for d in pool] or [0])
+        for (d, di), v in night.items():
+            if di == 4 and d in pool:
+                lag = top - int(counts.get(d, 0))
+                if lag > 0:
+                    bonus.append(30 * lag * v)
+        applied["friday_equality"] = True
     for doc in ng.get("never_friday") or []:
         v = night.get((doc, 4))
         if v is not None:
             model.Add(v == 0)
+    # Préférences / pools par jour (NIGHT_GUARD_DAY_RULES côté appli)
+    n_prefs = 0
+    for day, rule in (ng.get("day_preferences") or {}).items():
+        if day not in DAY_NAMES_FR:
+            continue
+        di = DAY_NAMES_FR.index(day)
+        only = rule.get("only")
+        prefer = rule.get("prefer")
+        for (d, dd), v in night.items():
+            if dd != di:
+                continue
+            if only and d not in only:
+                model.Add(v == 0)
+            elif prefer and d in prefer:
+                bonus.append(40 * v)
+                n_prefs += 1
+    applied["night_guard_day_preferences"] = n_prefs
     if ng.get("no_consecutive_nights"):
         docs = {d for (d, _di) in night}
         for doc in docs:
@@ -185,6 +212,26 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
             if row in usual and DAY_NAMES_FR[k[1]] not in usual[row]:
                 model.Add(v == 0)
     applied["hors_site_usual_days"] = bool(usual)
+
+    # 6bis. Coronarographistes : si M, O, W sont tous là, chacun une seule vacation par jour
+    # (Coro matin, Coro après-midi, nuit d'astreinte/garde) — pénalité souple par vacation en trop.
+    co = app_rules.get("coro_one_each_per_day") or {}
+    if co.get("doctors"):
+        docs = list(co["doctors"])
+        by_key = {k: v for k, v in x.items()}
+        for d_idx in range(5):
+            if not all((d, d_idx, "matin", "CORO") in by_key for d in docs):
+                continue  # un des trois est absent / salle fermée : règle sans objet ce jour
+            for d in docs:
+                load = [by_key[k] for k in (
+                    (d, d_idx, "matin", "CORO"), (d, d_idx, "am", "CORO"),
+                    (d, d_idx, "nuit", "ASTREINTE"), (d, d_idx, "nuit", "GARDE")) if k in by_key]
+                if len(load) < 2:
+                    continue
+                extra = model.NewIntVar(0, len(load), f"coro_extra_{d}_{d_idx}")
+                model.Add(extra >= sum(load) - 1)
+                bonus.append(-int(co.get("penalty", 80)) * extra)
+        applied["coro_one_each_per_day"] = True
 
     # 7. Priorités (bonus souples dans l'objectif)
     pr = app_rules.get("priorities") or {}

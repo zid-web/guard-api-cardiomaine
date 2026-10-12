@@ -478,7 +478,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # confirmé bug réel le 29/07/2026 : S garde nuit mercredi + ETT ped
     # mercredi = infaisable).
     FIXED_AFTERNOON_COMMITMENT_DAYS = {
-        ("S", "MERCREDI"), ("A", "MARDI"), ("P", "LUNDI"),  # FIXED_CS_ETT_SLOTS
+        # S retiré (consigne 13/10/2026) : S prioritaire en garde le mercredi, son ETT ped
+        # de l'après-midi est non exclusive (cumul autorisé, voir 7.2 plus bas).
+        ("A", "MARDI"), ("P", "LUNDI"),  # FIXED_CS_ETT_SLOTS
         ("Z", "LUNDI"), ("H", "MARDI"),                      # DOUBLON_CS_CONFIG
     }
 
@@ -1731,6 +1733,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             am_vars = [
                 v for (doc, d, sl, act), v in x.items()
                 if d == d_idx and sl == "am" and doc == doc_id and act != "GARDE"
+                # ETT ped de S le mercredi : cumul autorisé avec sa garde (créneau non exclusif)
+                and not (doc == "S" and d == 2 and act == "HIST::Apm - ETT salle 1")
+                and not (doc == "S" and d == 2 and act.startswith("HIST::Entrées PSS"))
             ]
             if am_vars:
                 presence_am = model.NewBoolVar(f"presence_am_{doc_id}_{d_idx}")

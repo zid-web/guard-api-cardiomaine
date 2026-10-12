@@ -2374,7 +2374,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         next_day_nm = DAY_NAMES_FR[next_d_idx] if next_d_idx < 7 else None
 
         # Médecins ayant leur 1/2 journée off l'après-midi du lendemain
-        off_next_apm_docs = half_days_off.get((next_day_nm, "am"), set()) if next_day_nm else set()
+        off_next_apm_docs = (
+            set(half_days_off.get((next_day_nm, "am"), set())) | set(half_days_off.get((next_day_nm, "matin"), set()))
+            if next_day_nm else set()
+        )
 
         for doc_id in GARDE_EQUITY_IDS:
             v_matin = x.get((doc_id, d_idx, "matin", "GARDE"))
@@ -2383,7 +2386,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
             # 1) Priorité pour les médecins dont la 1/2 journée off AM tombe le lendemain
             if doc_id in off_next_apm_docs and v_nuit is not None:
-                garde_eve_off_bonuses.append(15 * v_nuit)
+                garde_eve_off_bonuses.append(60 * v_nuit)  # priorité forte (consigne 13/10/2026)
 
             # 2) Continuité 3 créneaux (24h complète : Matin + AM + Nuit)
             if v_matin is not None and v_am is not None and v_nuit is not None:

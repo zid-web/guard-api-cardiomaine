@@ -463,6 +463,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model = cp_model.CpModel()
     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
     half_days_off_conflict_keys = []
+    half_days_off_guard_keys = []
 
     def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
         return any(d == doc_id and day == day_name for d, day, _slot in RYTHMO_FORCE)
@@ -539,6 +540,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             # mais autorise la création de la variable pour couvrir les tâches sous-effectif/absences.
             if activity not in ("GARDE", "ASTREINTE"):
                 half_days_off_conflict_keys.append((doc_id, d_idx, slot, activity))
+            elif not (activity == "ASTREINTE" and day_name == "MERCREDI" and slot == "am" and doc_id in ("M", "W")):
+                # Garde / astreinte un créneau de 1/2 journée off : autorisée seulement en dernier
+                # recours (sous-effectif), donc pénalisée plus fort qu'une activité ordinaire.
+                # Exception : ATL Midi de M/W le mercredi suit Coro Apm (couplage DOC022).
+                half_days_off_guard_keys.append((doc_id, d_idx, slot, activity))
 
         # RYTHMO : exclusion des AUTRES activités uniquement sur le(s) créneau(x)
         # réellement occupé par RYTHMO (précision par médecin - P=matin+am,
@@ -2368,7 +2374,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         next_day_nm = DAY_NAMES_FR[next_d_idx] if next_d_idx < 7 else None
 
         # Médecins ayant leur 1/2 journée off l'après-midi du lendemain
-        off_next_apm_docs = half_days_off.get((next_day_nm, "am"), set()) if next_day_nm else set()
+        off_next_apm_docs = (
+            set(half_days_off.get((next_day_nm, "am"), set())) | set(half_days_off.get((next_day_nm, "matin"), set()))
+            if next_day_nm else set()
+        )
 
         for doc_id in GARDE_EQUITY_IDS:
             v_matin = x.get((doc_id, d_idx, "matin", "GARDE"))
@@ -2377,7 +2386,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
             # 1) Priorité pour les médecins dont la 1/2 journée off AM tombe le lendemain
             if doc_id in off_next_apm_docs and v_nuit is not None:
-                garde_eve_off_bonuses.append(15 * v_nuit)
+                garde_eve_off_bonuses.append(60 * v_nuit)  # priorité forte (consigne 13/10/2026)
 
             # 2) Continuité 3 créneaux (24h complète : Matin + AM + Nuit)
             if v_matin is not None and v_am is not None and v_nuit is not None:
@@ -2404,6 +2413,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         var = x.get((doc_id, d_idx, slot, act))
         if var is not None:
             half_days_off_penalties.append(200 * var)
+    for doc_id, d_idx, slot, act in half_days_off_guard_keys:
+        var = x.get((doc_id, d_idx, slot, act))
+        if var is not None:
+            half_days_off_penalties.append(300 * var)
     half_days_off_penalty = sum(half_days_off_penalties) if half_days_off_penalties else 0
 
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0

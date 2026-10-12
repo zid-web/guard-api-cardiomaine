@@ -186,6 +186,26 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
                 model.Add(v == 0)
     applied["hors_site_usual_days"] = bool(usual)
 
+    # 6bis. Coronarographistes : si M, O, W sont tous là, chacun une seule vacation par jour
+    # (Coro matin, Coro après-midi, nuit d'astreinte/garde) — pénalité souple par vacation en trop.
+    co = app_rules.get("coro_one_each_per_day") or {}
+    if co.get("doctors"):
+        docs = list(co["doctors"])
+        by_key = {k: v for k, v in x.items()}
+        for d_idx in range(5):
+            if not all((d, d_idx, "matin", "CORO") in by_key for d in docs):
+                continue  # un des trois est absent / salle fermée : règle sans objet ce jour
+            for d in docs:
+                load = [by_key[k] for k in (
+                    (d, d_idx, "matin", "CORO"), (d, d_idx, "am", "CORO"),
+                    (d, d_idx, "nuit", "ASTREINTE"), (d, d_idx, "nuit", "GARDE")) if k in by_key]
+                if len(load) < 2:
+                    continue
+                extra = model.NewIntVar(0, len(load), f"coro_extra_{d}_{d_idx}")
+                model.Add(extra >= sum(load) - 1)
+                bonus.append(-int(co.get("penalty", 80)) * extra)
+        applied["coro_one_each_per_day"] = True
+
     # 7. Priorités (bonus souples dans l'objectif)
     pr = app_rules.get("priorities") or {}
     coro_first = set(pr.get("coro_first") or [])

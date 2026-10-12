@@ -70,3 +70,18 @@ def test_entrees_pss_binome():
 
 if __name__ == "__main__":
     test_entrees_pss_binome(); print("OK3")
+
+def test_coro_un_chacun():
+    rules = {"version": 1, "coro_one_each_per_day": {"doctors": ["M", "O", "W"], "penalty": 80}}
+    r = generate_week(_req(rules))
+    assert r.applied_rules["coro_one_each_per_day"]
+    load = {}
+    for a in r.assignments:
+        if a.doctor in "MOW" and ((a.activity == "CORO") or (a.slot == "nuit" and a.activity in ("ASTREINTE", "GARDE"))) and a.day_name in ("LUNDI","MARDI","MERCREDI","VENDREDI"):
+            load[(a.day_name, a.doctor)] = load.get((a.day_name, a.doctor), 0) + 1
+    print("charges M/O/W par jour:", load)
+    for day in ("LUNDI", "MARDI", "MERCREDI", "VENDREDI"):
+        assert max([load.get((day, d), 0) for d in "MOW"]) <= 2
+
+if __name__ == "__main__":
+    test_coro_un_chacun(); print("OK4")

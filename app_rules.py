@@ -50,12 +50,14 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
         try:
             d_idx = DAY_NAMES_FR.index(c["day"])
             for _doc, v in _vars_for_row(x, c["row"], d_idx):
-                # les gardes et astreintes ATL restent ouvertes les jours fériés (déjà exclues côté app)
-                model.Add(v == 0)
+                # SOUPLE : certaines vacations sont imposées par les règles dures du solveur
+                # (Coro, Rythmo, ETT ped...) ; une fermeture dure rendrait le modèle infaisable.
+                # L'appli vide de toute façon les cases fermées après génération.
+                bonus.append(-1000 * v)
                 n_closed += 1
         except (KeyError, ValueError, TypeError):
             continue
-    applied["closed_slots_vars_forced_off"] = n_closed
+    applied["closed_slots_vars_penalized"] = n_closed
 
     # 2. Gardes de nuit
     ng = app_rules.get("night_guard") or {}
@@ -123,7 +125,7 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
         try:
             d_idx = DAY_NAMES_FR.index(c["day"])
             for _doc, v in _vars_for_row(x, c["row"], d_idx):
-                model.Add(v == 0)
+                bonus.append(-1000 * v)
                 n_cleared += 1
         except (KeyError, ValueError, TypeError):
             continue

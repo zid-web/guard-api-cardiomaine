@@ -463,6 +463,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     model = cp_model.CpModel()
     x = {}  # (doc, day_idx, slot, activity) -> BoolVar
     half_days_off_conflict_keys = []
+    half_days_off_guard_keys = []
 
     def _is_rythmo_day(doc_id: str, day_name: str) -> bool:
         return any(d == doc_id and day == day_name for d, day, _slot in RYTHMO_FORCE)
@@ -539,6 +540,11 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             # mais autorise la création de la variable pour couvrir les tâches sous-effectif/absences.
             if activity not in ("GARDE", "ASTREINTE"):
                 half_days_off_conflict_keys.append((doc_id, d_idx, slot, activity))
+            elif not (activity == "ASTREINTE" and day_name == "MERCREDI" and slot == "am" and doc_id in ("M", "W")):
+                # Garde / astreinte un créneau de 1/2 journée off : autorisée seulement en dernier
+                # recours (sous-effectif), donc pénalisée plus fort qu'une activité ordinaire.
+                # Exception : ATL Midi de M/W le mercredi suit Coro Apm (couplage DOC022).
+                half_days_off_guard_keys.append((doc_id, d_idx, slot, activity))
 
         # RYTHMO : exclusion des AUTRES activités uniquement sur le(s) créneau(x)
         # réellement occupé par RYTHMO (précision par médecin - P=matin+am,
@@ -2404,6 +2410,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         var = x.get((doc_id, d_idx, slot, act))
         if var is not None:
             half_days_off_penalties.append(200 * var)
+    for doc_id, d_idx, slot, act in half_days_off_guard_keys:
+        var = x.get((doc_id, d_idx, slot, act))
+        if var is not None:
+            half_days_off_penalties.append(300 * var)
     half_days_off_penalty = sum(half_days_off_penalties) if half_days_off_penalties else 0
 
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0

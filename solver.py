@@ -2397,10 +2397,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     combo_bonus = sum(combo_priority_bonus) if combo_priority_bonus else 0
     nct_wed_penalty = sum(nct_wed_penalties) if 'nct_wed_penalties' in locals() and nct_wed_penalties else 0
     applied_rules_summary = None
+    app_rules_bonus_terms: List[Any] = []
     if req.app_rules:
         try:
             from app_rules import apply_app_rules
-            applied_rules_summary = apply_app_rules(model, x, req.app_rules, set(medecins_map), warnings)
+            applied_rules_summary, app_rules_bonus_terms = apply_app_rules(
+                model, x, req.app_rules, set(medecins_map), warnings, req.existing_schedule)
         except Exception as e:  # ne jamais casser la génération à cause des consignes
             warnings.append(f"app_rules ignoré (erreur): {e}")
 
@@ -2410,6 +2412,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         + astreinte_nuit_coro_matin_penalty + post_night_guard_penalty + nct_wed_penalty + half_days_off_penalty
         - historical_bonus - hors_site_bonus - reeduc_bonus - entrees_pss_bonus - p_wednesday_bonus - doublon_bonus - combo_bonus
         - garde_continuity_bonus - garde_eve_off_bonus
+        - (sum(app_rules_bonus_terms) if app_rules_bonus_terms else 0)
     )
 
 

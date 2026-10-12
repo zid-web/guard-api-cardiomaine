@@ -35,3 +35,20 @@ def test_creneau_ferme():
 
 if __name__ == "__main__":
     test_sans_app_rules_inchange(); test_app_rules_ack_et_nuits_non_consecutives(); test_creneau_ferme(); print("OK")
+
+def test_eligibilites_et_hors_site():
+    rules = {"version": 1, "eligibility": {"ett_forbidden": ["O"], "ee_solo_doctors": ["O", "V", "DAAS"]},
+             "hors_site_usual_days": {"Hors site - CDL": ["MARDI"], "Hors site - IRM": ["LUNDI", "VENDREDI"]},
+             "priorities": {"coro_first": ["M", "O", "W"], "echo_group": ["H", "Z", "G", "B", "S"]},
+             "fixed_assignments": [{"row": "Garde Nuit", "day": "MARDI", "doctors": ["A"]}],
+             "cleared_cells": [{"row": "Garde Nuit", "day": "JEUDI"}]}
+    r = generate_week(_req(rules))
+    assert r.applied_rules["ee_rules"] and r.applied_rules["priorities"]
+    assert not any(a.doctor == "O" and "ETT" in a.activity for a in r.assignments)
+    assert not any(a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "JEUDI" for a in r.assignments)
+    for a in r.assignments:
+        if a.activity == "CDL":
+            assert a.day_name == "MARDI"
+
+if __name__ == "__main__":
+    test_eligibilites_et_hors_site(); print("OK2")

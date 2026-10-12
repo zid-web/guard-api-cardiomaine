@@ -2561,6 +2561,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
                     ))
 
     else:
+        if req.app_rules:
+            # Les consignes de l'appli ne doivent jamais rendre la semaine infaisable :
+            # on régénère sans elles (l'appli les applique ensuite après génération).
+            retry = generate_week(req.model_copy(update={"app_rules": None}))
+            retry.warnings.append(
+                "Consignes de l'appli (app_rules) incompatibles avec les règles du solveur cette semaine : "
+                "génération sans elles, règles appliquées après génération."
+            )
+            return retry
         warnings.append("Aucune solution trouvée par le solveur")
 
     # --- 13bis. Lignes dérivées (non optimisées par le solveur) ---

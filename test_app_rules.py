@@ -52,3 +52,21 @@ def test_eligibilites_et_hors_site():
 
 if __name__ == "__main__":
     test_eligibilites_et_hors_site(); print("OK2")
+
+def test_entrees_pss_binome():
+    r = generate_week(_req())
+    garde = {a.day_name: a.doctor for a in r.assignments if a.activity == "GARDE" and a.slot == "am"}
+    pss = {}
+    for a in r.assignments:
+        if "ntr" in a.activity and "PSS" in a.activity:
+            pss.setdefault(a.day_name, []).append(a.doctor)
+    for d in ("MERCREDI", "JEUDI", "VENDREDI"):
+        if d in pss:
+            assert pss[d] == [garde[d]], (d, pss[d], garde.get(d))
+    for d in ("LUNDI", "MARDI"):
+        if d in pss and d in garde:
+            assert garde[d] in pss[d] and len(pss[d]) <= 2, (d, pss[d], garde[d])
+    print("pss", pss, "garde", garde)
+
+if __name__ == "__main__":
+    test_entrees_pss_binome(); print("OK3")

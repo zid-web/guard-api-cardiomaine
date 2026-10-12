@@ -1130,7 +1130,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     doublon_bonus = sum(doublon_bonus_terms) if doublon_bonus_terms else 0
 
     # --- 2quater. Entrées PSS (confirmé avec l'utilisateur le 26/07/2026) ---
-    # Lundi/mardi : roulement parmi les médecins affectés ce jour-là en Apm -
+    # Lundi/mardi (consigne 12/10/2026) : binôme = médecin de garde d'après-midi + 1 autre médecin.
+    # L'autre médecin : roulement parmi les médecins affectés ce jour-là en Apm -
     # ETT salle 1/2, Apm - Stress, Apm - Cs PSS ou Apm - Cs Tessée (le "pool
     # clinique" de l'après-midi), à l'EXCLUSION de tout médecin qui, ce même
     # jour (n'importe quel créneau), fait CORO, RYTHMO, ou une activité hors
@@ -1145,8 +1146,12 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     entrees_pss_activity = "HIST::Entrées PSS"
     entrees_pss_fill_bonus: List[Any] = []
 
-    for d_idx in (0, 1):  # LUNDI, MARDI - roulement pool clinique
+    for d_idx in (0, 1):  # LUNDI, MARDI - binôme : médecin de garde d'après-midi + 1 autre (pool clinique)
         day_name = DAY_NAMES_FR[d_idx]
+        garde_midi_vars = {
+            doc_id_x: v for (doc_id_x, dd, sl, act), v in x.items()
+            if dd == d_idx and sl == "am" and act == "GARDE"
+        }
         clinic_vars_by_doc: Dict[str, List[Any]] = {}
         for (doc_id_x, dd, sl, act), var in list(x.items()):
             if dd != d_idx or not act.startswith("HIST::"):
@@ -1154,8 +1159,17 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             if act[len("HIST::"):] in ENTREES_PSS_CLINIC_ROW_KEYS:
                 clinic_vars_by_doc.setdefault(doc_id_x, []).append(var)
 
-        day_vars: Dict[str, Any] = {}
+        # Le médecin de garde d'après-midi est toujours dans le binôme (jumelage direct).
+        for doc_id_x, garde_var in garde_midi_vars.items():
+            var = model.NewBoolVar(f"entreespss_{doc_id_x}_{d_idx}")
+            x[(doc_id_x, d_idx, "am", entrees_pss_activity)] = var
+            model.Add(var == garde_var)
+
+        # L'autre médecin : roulement parmi le pool clinique (hors garde midi).
+        other_vars: Dict[str, Any] = {}
         for doc_id_x, vlist in clinic_vars_by_doc.items():
+            if doc_id_x in garde_midi_vars:
+                continue
             in_clinic_pool = model.NewBoolVar(f"clinic_pool_{doc_id_x}_{d_idx}")
             model.AddMaxEquality(in_clinic_pool, vlist)
 
@@ -1174,23 +1188,21 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             for ev in exclusion_vars:
                 model.Add(var == 0).OnlyEnforceIf(ev)
 
-            day_vars[doc_id_x] = var
+            other_vars[doc_id_x] = var
 
-        if day_vars:
-            model.Add(sum(day_vars.values()) <= 1)
+        if other_vars:
+            model.Add(sum(other_vars.values()) <= 1)
             # Forte préférence de remplissage (pas une obligation stricte, pour
             # éviter une infaisabilité si tous les candidats du pool clinique
-            # sont par ailleurs exclus ce jour-là) : sans ce bonus, l'activité
-            # étant purement optionnelle, le solveur la laisserait vide par
-            # défaut faute de coût associé à ne pas la remplir.
+            # sont par ailleurs exclus ce jour-là).
             filled_var = model.NewBoolVar(f"entreespss_filled_{d_idx}")
-            model.AddMaxEquality(filled_var, list(day_vars.values()))
+            model.AddMaxEquality(filled_var, list(other_vars.values()))
             entrees_pss_fill_bonus.append(20 * filled_var)
-            if not clinic_vars_by_doc:
-                warnings.append(
-                    f"Entrées PSS {day_name} : aucun médecin en Cs/ETT/Stress "
-                    f"cet après-midi d'après l'historique reçu - rien à proposer."
-                )
+        elif not garde_midi_vars:
+            warnings.append(
+                f"Entrées PSS {day_name} : aucun médecin en Cs/ETT/Stress "
+                f"cet après-midi d'après l'historique reçu - rien à proposer."
+            )
 
     for d_idx in (2, 3, 4):  # MERCREDI, JEUDI, VENDREDI - jumelé au garde de garde Midi
         day_name = DAY_NAMES_FR[d_idx]

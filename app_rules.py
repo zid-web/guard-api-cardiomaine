@@ -240,6 +240,35 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
                 bonus.append(-int(co.get("penalty", 80)) * extra)
         applied["coro_one_each_per_day"] = True
 
+    # 6ter. Astreinte ATL Nuit : jamais FV ; le médecin d'ATL Midi fait la nuit si possible
+    atl = app_rules.get("atl_night") or {}
+    if atl:
+        for doc in atl.get("never") or []:
+            for di in range(7):
+                v = x.get((doc, di, "nuit", "ASTREINTE"))
+                if v is not None:
+                    model.Add(v == 0)
+        if atl.get("follow_midi"):
+            for (d, di, sl, act), v_midi in list(x.items()):
+                if sl != "am" or act != "ASTREINTE" or di > 4:
+                    continue
+                v_nuit = x.get((d, di, "nuit", "ASTREINTE"))
+                if v_nuit is None:
+                    continue
+                both = model.NewBoolVar(f"atl_midi_nuit_{d}_{di}")
+                model.AddBoolAnd([v_midi, v_nuit]).OnlyEnforceIf(both)
+                model.AddBoolOr([v_midi.Not(), v_nuit.Not()]).OnlyEnforceIf(both.Not())
+                bonus.append(40 * both)
+        if atl.get("not_with_night_guard"):
+            for di in range(7):
+                for (d, dd, sl, act), v_g in list(x.items()):
+                    if dd != di or sl != "nuit" or act != "GARDE":
+                        continue
+                    v_a = x.get((d, di, "nuit", "ASTREINTE"))
+                    if v_a is not None:
+                        model.Add(v_g + v_a <= 1)
+        applied["atl_night"] = True
+
     # 7. Priorités (bonus souples dans l'objectif)
     pr = app_rules.get("priorities") or {}
     coro_first = set(pr.get("coro_first") or [])

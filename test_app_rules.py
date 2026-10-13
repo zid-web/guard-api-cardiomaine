@@ -120,3 +120,26 @@ def test_mercredi_s_p_alternent():
 
 if __name__ == "__main__":
     test_mercredi_s_p_alternent(); print("OK7")
+
+def test_atl_nuit():
+    rules = {"version": 1, "atl_night": {"never": ["FV"], "follow_midi": True, "not_with_night_guard": True}}
+    base = generate_week(_req(None))
+    r = generate_week(_req(rules))
+    assert r.applied_rules["atl_night"]
+    def pairs(out):
+        midi = {a.day_name: a.doctor for a in out.assignments if a.activity == "ASTREINTE" and a.slot == "am"}
+        nuit = {a.day_name: a.doctor for a in out.assignments if a.activity == "ASTREINTE" and a.slot == "nuit"}
+        garde = {a.day_name: a.doctor for a in out.assignments if a.activity == "GARDE" and a.slot == "nuit"}
+        return midi, nuit, garde
+    midi, nuit, garde = pairs(r)
+    assert "FV" not in nuit.values()
+    for d, doc in nuit.items():
+        assert garde.get(d) != doc, (d, doc)
+    same = sum(1 for d in ("LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI") if d in midi and midi[d] == nuit.get(d))
+    bmidi, bnuit, _ = pairs(base)
+    same_base = sum(1 for d in ("LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI") if d in bmidi and bmidi[d] == bnuit.get(d))
+    print("ATL midi=nuit :", same_base, "->", same, nuit)
+    assert same >= same_base
+
+if __name__ == "__main__":
+    test_atl_nuit(); print("OK8")

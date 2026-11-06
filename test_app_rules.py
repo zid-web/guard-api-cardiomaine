@@ -155,3 +155,18 @@ def test_case_saisie_ch_ne_bloque_pas():
 
 if __name__ == "__main__":
     test_case_saisie_ch_ne_bloque_pas(); print("OK9")
+
+def test_interdits_appli():
+    # L'appli interdit H en Garde Nuit mardi et O en Coro matin lundi → le solveur les évite
+    rules = {"version": 2, "forbidden": {"Garde Nuit": {"MARDI": ["G", "B", "M", "W"]}, "Matin - Coro": {"LUNDI": ["O", "W"]}}}
+    r = generate_week(_req(rules))
+    assert r.applied_rules["forbidden_vars_penalized"] > 0
+    assert "_forbidden_vars" not in r.applied_rules
+    mardi = [a.doctor for a in r.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "MARDI"]
+    assert not set(mardi) & {"G", "B", "M", "W"}, mardi
+    coro = [a.doctor for a in r.assignments if a.activity == "CORO" and a.slot == "matin" and a.day_name == "LUNDI"]
+    assert not set(coro) & {"O", "W"}, coro
+    assert r.applied_rules["forbidden_violations"] == []
+
+if __name__ == "__main__":
+    test_interdits_appli(); print("OK10")

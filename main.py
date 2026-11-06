@@ -28,7 +28,9 @@ API_KEY = os.environ.get("GUARD_API_KEY", "")
 if not API_KEY:
     # Ne bloque pas le demarrage (utile en dev), mais le fait savoir clairement
     # dans les logs Render : sans GUARD_API_KEY definie, l'API reste PUBLIQUE.
-    print("[WARN] GUARD_API_KEY n'est pas definie : l'API est actuellement sans authentification.")
+    print("[WARN] GUARD_API_KEY n'est pas definie : l'API est actuellement sans authentification.", flush=True)
+else:
+    print("[INFO] GUARD_API_KEY definie : authentification par cle API active.", flush=True)
 
 
 def _check_api_key(x_api_key: Optional[str]):

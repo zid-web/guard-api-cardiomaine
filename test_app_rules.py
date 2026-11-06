@@ -143,3 +143,15 @@ def test_atl_nuit():
 
 if __name__ == "__main__":
     test_atl_nuit(); print("OK8")
+
+def test_case_saisie_ch_ne_bloque_pas():
+    # S46 : nuit ATL du vendredi saisie pour CH (échange) une semaine W/O/M → ne doit pas rendre infaisable
+    rules = {"version": 1, "fixed_assignments": [{"row": "Astreintes ATL Nuit", "day": "VENDREDI", "doctors": ["CH"]},
+                                                 {"row": "Garde Nuit", "day": "LUNDI", "doctors": ["FV"]}]}
+    q = _req(rules); q.week_start_date = "2026-11-09"; q.week_type = 2; q.astreinte_week_type = 2
+    out = generate_week(q)
+    assert out.rules_version == 1, out.warnings
+    assert not any("incompatibles" in w for w in out.warnings)
+
+if __name__ == "__main__":
+    test_case_saisie_ch_ne_bloque_pas(); print("OK9")

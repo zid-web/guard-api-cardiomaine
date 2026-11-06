@@ -171,7 +171,11 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
                 if doc in docs:
                     bonus.append(50 * v)  # souple : une saisie validée ne doit pas rendre le modèle infaisable
                 else:
-                    model.Add(v == 0)  # la case est déjà occupée
+                    # Case déjà occupée : pénalité forte, pas d'interdiction. Une saisie d'un médecin que
+                    # le solveur ne place pas lui-même (CH en échange un soir W/O/M, FV…) laissait sinon
+                    # la case sans candidat et rendait la semaine infaisable (S46, 06/11/2026).
+                    # L'appli conserve de toute façon la saisie validée après génération.
+                    bonus.append(-1000 * v)
                     n_fixed += 1
         except (KeyError, ValueError, TypeError):
             continue

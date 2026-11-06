@@ -32,8 +32,8 @@ def _vars_for_row(x: Dict[tuple, Any], row: str, d_idx: int) -> List[Tuple[str, 
     if row in ROW_TO_SLOT_ACTIVITY:
         slot, act = ROW_TO_SLOT_ACTIVITY[row]
         return [(k[0], v) for k, v in x.items() if k[1] == d_idx and k[2] == slot and k[3] == act]
-    hist = f"HIST::{row}"
-    return [(k[0], v) for k, v in x.items() if k[1] == d_idx and k[3] == hist]
+    acts = (f"HIST::{row}", f"HORSSITE::{row}")
+    return [(k[0], v) for k, v in x.items() if k[1] == d_idx and k[3] in acts]
 
 
 def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], doctor_ids: set, warnings: List[str],
@@ -171,7 +171,11 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
                 if doc in docs:
                     bonus.append(50 * v)  # souple : une saisie validée ne doit pas rendre le modèle infaisable
                 else:
-                    model.Add(v == 0)  # la case est déjà occupée
+                    # Case déjà occupée : pénalité forte, pas d'interdiction. Une saisie d'un médecin que
+                    # le solveur ne place pas lui-même (CH en échange un soir W/O/M, FV…) laissait sinon
+                    # la case sans candidat et rendait la semaine infaisable (S46, 06/11/2026).
+                    # L'appli conserve de toute façon la saisie validée après génération.
+                    bonus.append(-1000 * v)
                     n_fixed += 1
         except (KeyError, ValueError, TypeError):
             continue
@@ -268,6 +272,27 @@ def apply_app_rules(model, x: Dict[tuple, Any], app_rules: Dict[str, Any], docto
                     if v_a is not None:
                         model.Add(v_g + v_a <= 1)
         applied["atl_night"] = True
+
+    # 6quater. Interdits calculés par l'appli avec sa propre validation (saisie manuelle) :
+    # congés, ½ journées off, éligibilités, fériés, cases fermées, binômes, créneau déjà pris…
+    # Pénalité très forte (au-dessus de toute préférence) plutôt qu'interdiction : le solveur les
+    # évite toujours quand c'est possible, sans jamais devenir infaisable. Les écarts restants
+    # sont renvoyés pour que l'appli les explique.
+    forbidden_vars: List[Tuple[str, str, str, Any]] = []
+    for row, by_day in (app_rules.get("forbidden") or {}).items():
+        if not isinstance(by_day, dict):
+            continue
+        for day, docs in by_day.items():
+            if day not in DAY_NAMES_FR or not isinstance(docs, list):
+                continue
+            d_idx = DAY_NAMES_FR.index(day)
+            blocked = set(docs)
+            for doc, v in _vars_for_row(x, row, d_idx):
+                if doc in blocked:
+                    bonus.append(-3000 * v)
+                    forbidden_vars.append((row, day, doc, v))
+    applied["forbidden_vars_penalized"] = len(forbidden_vars)
+    applied["_forbidden_vars"] = forbidden_vars  # retiré avant la réponse (voir solver.py)
 
     # 7. Priorités (bonus souples dans l'objectif)
     pr = app_rules.get("priorities") or {}

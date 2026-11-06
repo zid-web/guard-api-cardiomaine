@@ -383,6 +383,10 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     warnings = []
     week_start = date.fromisoformat(req.week_start_date)
     days = jours_semaine(week_start)
+    # Jours fériés transmis par l'appli (app_rules.holidays) : toutes les activités fermées
+    # sauf gardes et astreintes — les créneaux fixes (Rythmo, ETT ped, Coro mercredi) ne
+    # sont pas imposés ces jours-là (S46, Armistice).
+    HOLIDAY_DAYS = set(((req.app_rules or {}).get("holidays") or {}).keys()) & set(DAY_NAMES_FR)
 
     # --- 0. Chargement des règles (défaut JSON + surcharge éventuelle du front) ---
     rules = merge_rules(load_default_rules(), req.rules_override)
@@ -419,6 +423,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
             (mercredi_matin_doctor, "MERCREDI", "matin"), ("U", "MERCREDI", "am"),
             ("P", "VENDREDI", "am"),
         ]
+    RYTHMO_FORCE = [t for t in RYTHMO_FORCE if t[1] not in HOLIDAY_DAYS]
     NCT_ALLOWED = set(rules["nct_allowed"])
     # Restriction Cs PSS vs Cs Tessée par médecin (confirmé utilisateur
     # 28/07/2026, exclusion stricte pour les 13 médecins concernés).
@@ -486,6 +491,8 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     def add_var_if_allowed(doc_id: str, d_idx: int, slot: str, activity: str):
         day = days[d_idx]
+        if DAY_NAMES_FR[d_idx] in HOLIDAY_DAYS and activity not in ("GARDE", "ASTREINTE"):
+            return
         if is_on_vacation(doc_id, day, req.vacations):
             return
 
@@ -879,7 +886,9 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # pour être robuste même sans historical_patterns.
     mercredi_idx = DAY_NAMES_FR.index("MERCREDI")
     mercredi_am_maintenance = is_room_under_maintenance(days[mercredi_idx], "am", req.room_maintenance)
-    if mercredi_am_maintenance:
+    if "MERCREDI" in HOLIDAY_DAYS:
+        pass  # mercredi férié : pas de Coro
+    elif mercredi_am_maintenance:
         warnings.append("Coro mercredi après-midi : salle en maintenance - créneau non couvert.")
     elif "O" in medecins_map and not (
         is_on_vacation("O", days[mercredi_idx], req.vacations) or is_on_vacation("O", days[mercredi_idx], req.congres)
@@ -977,7 +986,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         activity_name = f"HIST::{row_key}"  # préfixe technique pour ne jamais collider avec ACTIVITIES
 
         for day_name, pattern in by_day.items():
-            if day_name not in DAY_NAMES_FR:
+            if day_name not in DAY_NAMES_FR or day_name in HOLIDAY_DAYS:
                 continue
             d_idx = DAY_NAMES_FR.index(day_name)
             eligible = pattern.get("eligible_doctors", [])
@@ -1038,7 +1047,7 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
     # l'instant (confirmé explicitement : seulement S).
     NON_EXCLUSIVE_FIXED_DOCTORS = {"S"}
     for doc_id, day_name, slot, row_key in FIXED_CS_ETT_SLOTS:
-        if doc_id not in medecins_map:
+        if doc_id not in medecins_map or day_name in HOLIDAY_DAYS:
             continue
         d_idx = DAY_NAMES_FR.index(day_name)
         if is_on_vacation(doc_id, days[d_idx], req.vacations) or is_on_vacation(doc_id, days[d_idx], req.congres):
@@ -2453,6 +2462,15 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
 
     # --- 13. Extraction des résultats ---
     assignments: List[Assignment] = []
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and applied_rules_summary:
+        # Interdits de l'appli que le solveur n'a pas pu éviter → renvoyés pour explication
+        fvars = applied_rules_summary.pop("_forbidden_vars", [])
+        applied_rules_summary["forbidden_violations"] = [
+            [row, day, doc] for (row, day, doc, v) in fvars if solver.Value(v) == 1
+        ]
+    elif applied_rules_summary:
+        applied_rules_summary.pop("_forbidden_vars", None)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         for (doc, d_idx, slot, activity), var in x.items():

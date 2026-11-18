@@ -1059,7 +1059,13 @@ def generate_week(req: GenerateWeekRequest) -> GenerateWeekResponse:
         if var is None:
             var = model.NewBoolVar(f"fixed_{doc_id}_{d_idx}_{row_key}")
             x[(doc_id, d_idx, slot, activity_name)] = var
-        model.Add(var == 1)
+        # S mercredi : l'ETT pédiatrique saute quand S est de garde le midi (la garde passe
+        # en priorité — consigne 18/11/2026) ; sinon elle reste imposée.
+        s_garde_midi = x.get(("S", d_idx, "am", "GARDE")) if (doc_id, day_name) == ("S", "MERCREDI") else None
+        if s_garde_midi is not None:
+            model.Add(var + s_garde_midi == 1)
+        else:
+            model.Add(var == 1)
 
         # Réserve exclusivement ce créneau à ce médecin : force à 0 tout
         # autre médecin qui aurait aussi une variable sur cette même case

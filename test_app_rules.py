@@ -116,7 +116,9 @@ def test_mercredi_s_p_alternent():
     mer = [a.doctor for a in out.assignments if a.activity == "GARDE" and a.slot == "nuit" and a.day_name == "MERCREDI"]
     assert mer == ["S"], mer
     ett = [a.doctor for a in out.assignments if a.day_name == "MERCREDI" and a.slot == "am" and "ETT salle 1" in a.activity]
-    assert ett == ["S"], ett  # ETT ped conservée avec la garde
+    midi = [a.doctor for a in out.assignments if a.day_name == "MERCREDI" and a.slot == "am" and a.activity == "GARDE"]
+    # Consigne 18/11/2026 : S de garde le mercredi midi → son ETT ped saute
+    assert ("S" in midi) != ("S" in ett), (midi, ett)
 
 if __name__ == "__main__":
     test_mercredi_s_p_alternent(); print("OK7")
@@ -170,3 +172,19 @@ def test_interdits_appli():
 
 if __name__ == "__main__":
     test_interdits_appli(); print("OK10")
+
+def test_s_ped_saute_si_garde_midi():
+    # S de garde mercredi midi : pas d'ETT ped ce jour-là ; sinon ETT ped présente
+    rules = {"version": 2, "night_guard": {"day_preferences": {"MERCREDI": {"prefer": ["S"]}}}}
+    for ws in ("2026-11-16", "2026-11-30"):
+        q = _req(rules); q.week_start_date = ws; q.week_type = 2
+        out = generate_week(q)
+        midi = [a.doctor for a in out.assignments if a.day_name == "MERCREDI" and a.slot == "am" and a.activity == "GARDE"]
+        ped = [a.doctor for a in out.assignments if a.day_name == "MERCREDI" and a.slot == "am" and "ETT salle 1" in a.activity]
+        if "S" in midi:
+            assert "S" not in ped, (ws, midi, ped)
+        else:
+            assert ped == ["S"], (ws, midi, ped)
+
+if __name__ == "__main__":
+    test_s_ped_saute_si_garde_midi(); print("OK11")
